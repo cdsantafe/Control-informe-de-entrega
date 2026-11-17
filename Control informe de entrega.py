@@ -3,8 +3,8 @@
 Tablero de Auditoría y Control de Asignación de Flota
 Cervecería Quilmes · Operación Santa Fe
 
-Ejecutar:   streamlit run app.py
-Requiere:   pip install streamlit pandas openpyxl requests
+Ejecutar:    streamlit run app.py
+Requiere:    pip install streamlit pandas openpyxl requests
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import requests
 import streamlit as st
 
 # ════════════════════════════════════════════════════════════════════════════
-# CONSTANTES DE NEGOCIO (editar acá si cambian las reglas)
+# CONSTANTES DE NEGOCIO
 # ════════════════════════════════════════════════════════════════════════════
 URL_FLOTA = (
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vRlajPJLs9j3Kl6WU0-xb7xxuPfV1jLwgp3tYSMBerrkqmZHHwnTnriwHKlliGjH2gKDNwBOycnUJRo/pub?output=xlsx"
@@ -31,12 +31,12 @@ UNIDADES_CENTRO = {"AH474WT", "PAP418"}
 CENTRO_MAX_OB = 10
 
 POOL_SMK = {"AH243PW", "AH528YU", "PAC686", "NXF323"}
-SMK_MAX_CLIENTES = 5  # aplica a planillas SMK con menos de 5 clientes
+SMK_MAX_CLIENTES = 5
 
 UNIDADES_GAS = {"AE514OY", "AE514OZ"}
 GAS_MAX_CLI = 15
 GAS_MAX_OB = 6
-GAS_EXCEPCION_CLI = 5  # no aplica límite si Cli. < 5
+GAS_EXCEPCION_CLI = 5
 
 CABLES_BAJOS_PROHIBIDAS = {
     "NIF946", "PJX924", "NHH822", "OTW502", "PPN082", "MPS763", "AE514OY", "AE514OZ",
@@ -72,7 +72,7 @@ ALIAS_INFORME = {
     "ob": ["OB"],
     "kg": ["KGRTRUCK", "KGTRUCK"],
     "cap": ["CAPACIDADTRUCKCAMION", "CAPACIDADTRUCK"],
-    "vuelta": ["VUELTA", "SALIDA", "VTA"],
+    "vuelta": ["TIPODEREPARTO", "VUELTA", "SALIDA", "VTA"],
     "camion": ["CAMION", "TIPOCAMION", "TRUCK", "VEHICULO", "TIPOTRUCK"],
 }
 REQUERIDAS_INFORME = ["planilla", "patente", "zona", "cli", "ob", "kg"]
@@ -86,7 +86,6 @@ NOMBRES_LEGIBLES = {
 # UTILIDADES DE TEXTO / NÚMEROS
 # ════════════════════════════════════════════════════════════════════════════
 def norm_txt(s) -> str:
-    """Mayúsculas, sin acentos, sin ° / º y con espacios colapsados."""
     if s is None or (not isinstance(s, str) and pd.isna(s)):
         return ""
     t = unicodedata.normalize("NFKD", str(s))
@@ -96,7 +95,6 @@ def norm_txt(s) -> str:
 
 
 def clave(s) -> str:
-    """Clave alfanumérica para comparar encabezados ('Cli.' -> 'CLI')."""
     return re.sub(r"[^A-Z0-9]", "", norm_txt(s))
 
 
@@ -107,7 +105,6 @@ def norm_pat(s) -> str:
 
 
 def a_numero(serie: pd.Series) -> pd.Series:
-    """Convierte a float tolerando textos ('1.234,5', '', '-') y celdas vacías."""
     def conv(v):
         if v is None or (not isinstance(v, str) and pd.isna(v)):
             return float("nan")
@@ -128,7 +125,6 @@ def a_numero(serie: pd.Series) -> pd.Series:
 
 
 def n(x) -> str:
-    """Formato legible de números (miles con punto, sin decimales inútiles)."""
     if x is None or pd.isna(x):
         return "s/d"
     x = float(x)
@@ -191,7 +187,6 @@ def cargar_informe(archivo) -> tuple[pd.DataFrame, list[str]]:
             f"Columnas detectadas: {', '.join(map(str, raw.columns))}"
         )
 
-    # Descarta filas sin planilla o "(en blanco)"
     col_pl = mapa["planilla"]
     raw = raw[raw[col_pl].notna()]
     raw = raw[~raw[col_pl].map(norm_txt).isin(["", "(EN BLANCO)"])].copy()
@@ -211,16 +206,11 @@ def cargar_informe(archivo) -> tuple[pd.DataFrame, list[str]]:
         df["cap"] = a_numero(raw[mapa["cap"]])
     else:
         df["cap"] = float("nan")
-        avisos.append("No se encontró la columna 'Capacidad Truck Camion'; se usa solo la pestaña CAMIONES.")
 
     if "vuelta" in mapa:
         df["vuelta"] = raw[mapa["vuelta"]].map(parse_vuelta)
     else:
         df["vuelta"] = 1
-        avisos.append(
-            "No se encontró una columna de 'Vuelta' en Salidas: se asume Primera Vuelta para todas las "
-            "planillas, por lo que la disponibilidad por vuelta de las alternativas es aproximada."
-        )
 
     if "camion" in mapa:
         df["camion"] = raw[mapa["camion"]].fillna("").astype(str).str.strip()
@@ -231,7 +221,7 @@ def cargar_informe(archivo) -> tuple[pd.DataFrame, list[str]]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# CARGA: BASE DE FLOTA
+# CARGA: BASE DE FLOTA (CAMIONES y Disponibilidad Flota Diaria)
 # ════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=900, show_spinner="Descargando flota desde Google Sheets…")
 def descargar_flota(url: str):
@@ -240,50 +230,50 @@ def descargar_flota(url: str):
     return r.content, datetime.now()
 
 
-def _leer_hoja_con_encabezado(xl: pd.ExcelFile, hoja: str) -> pd.DataFrame:
-    """Lee la hoja detectando automáticamente la fila de encabezados (la que contiene 'Patente')."""
-    raw = xl.parse(hoja, header=None, dtype=object)
-    raw = raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
-    if raw.empty:
-        raise ValueError(f"La pestaña '{hoja}' está vacía.")
-    idx = 0
-    for i in range(min(25, len(raw))):
-        if any(clave(v) in CLAVES_PATENTE for v in raw.iloc[i].tolist()):
-            idx = i
+@st.cache_data(show_spinner="Procesando base de flota…")
+def parsear_flota(contenido: bytes):
+    xl = pd.ExcelFile(io.BytesIO(contenido))
+    h_cam = next((h for h in xl.sheet_names if clave(h) == "CAMIONES"), None)
+    h_disp = next((h for h in xl.sheet_names if "DISPONIBILIDAD" in clave(h)), None)
+    
+    if h_cam is None or h_disp is None:
+        raise ValueError(
+            f"No se encontraron las pestañas necesarias ('CAMIONES' y 'Disponibilidad Flota Diaria'). Encontradas: {', '.join(xl.sheet_names)}"
+        )
+        
+    # 1. Pestaña CAMIONES
+    raw_cam = xl.parse(h_cam, header=None, dtype=object).dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    idx_cam = 0
+    for i in range(min(25, len(raw_cam))):
+        if any(clave(v) in CLAVES_PATENTE for v in raw_cam.iloc[i].tolist()):
+            idx_cam = i
             break
-    cabecera, vistos = [], {}
-    for j, v in enumerate(raw.iloc[idx].tolist()):
-        if isinstance(v, (pd.Timestamp, datetime)):
-            nombre = v.strftime("%d/%m/%Y")
-        elif v is None or pd.isna(v):
-            nombre = f"COL{j}"
-        else:
-            nombre = re.sub(r"\s+", " ", str(v)).strip()
+    cab_cam, vistos = [], {}
+    for j, v in enumerate(raw_cam.iloc[idx_cam].tolist()):
+        nombre = f"COL{j}" if v is None or pd.isna(v) else re.sub(r"\s+", " ", str(v)).strip()
         if nombre in vistos:
             vistos[nombre] += 1
             nombre = f"{nombre}.{vistos[nombre]}"
         else:
             vistos[nombre] = 0
-        cabecera.append(nombre)
-    df = raw.iloc[idx + 1:].copy()
-    df.columns = cabecera
-    return df.reset_index(drop=True)
+        cab_cam.append(nombre)
+    df_cam = raw_cam.iloc[idx_cam + 1:].copy()
+    df_cam.columns = cab_cam
+    df_cam = df_cam.reset_index(drop=True)
 
+    # 2. Pestaña Disponibilidad Flota Diaria (Matrícula en Columna E / índice 4, Estado en Columna J / índice 9)
+    raw_disp = xl.parse(h_disp, header=None, dtype=object).dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    df_disp_proc = pd.DataFrame()
+    if raw_disp.shape[1] >= 10:
+        df_disp_proc["PATENTE"] = raw_disp.iloc[:, 4].map(norm_pat)
+        df_disp_proc["ESTADO"] = raw_disp.iloc[:, 9].map(norm_txt)
+    else:
+        df_disp_proc["PATENTE"] = raw_disp.iloc[:, 0].map(norm_pat)
+        df_disp_proc["ESTADO"] = raw_disp.iloc[:, 1].map(norm_txt)
 
-@st.cache_data(show_spinner="Procesando base de flota…")
-def parsear_flota(contenido: bytes):
-    xl = pd.ExcelFile(io.BytesIO(contenido))
-    h_cam = next((h for h in xl.sheet_names if clave(h) == "CAMIONES"), None)
-    h_disp = next((h for h in xl.sheet_names if clave(h) == "DISPONIBILIDADFLOTADIARIA"), None)
-    if h_disp is None:
-        h_disp = next((h for h in xl.sheet_names if "DISPONIBILIDAD" in clave(h)), None)
-    faltan = [nom for nom, h in (("CAMIONES", h_cam), ("Disponibilidad flota Diaria", h_disp)) if h is None]
-    if faltan:
-        raise ValueError(
-            f"El archivo de flota no tiene la/s pestaña/s: {', '.join(faltan)}. "
-            f"Pestañas encontradas: {', '.join(xl.sheet_names)}"
-        )
-    return _leer_hoja_con_encabezado(xl, h_cam), _leer_hoja_con_encabezado(xl, h_disp)
+    df_disp_proc = df_disp_proc[df_disp_proc["PATENTE"].str.fullmatch(r"[A-Z0-9]{6,7}", na=False)].reset_index(drop=True)
+
+    return df_cam, df_disp_proc
 
 
 def detectar_cols_camiones(df: pd.DataFrame) -> dict:
@@ -291,7 +281,7 @@ def detectar_cols_camiones(df: pd.DataFrame) -> dict:
     for c in df.columns:
         claves.setdefault(clave(c), c)
     col_pat = next((claves[k] for k in CLAVES_PATENTE if k in claves), None)
-    col_pal = claves.get("P")
+    col_pal = claves.get("P") # Columna P asignada a paletas máx.
     pref_kg = ["CAPACIDADKG", "CAPKG", "KG", "KGS", "KILOS", "PESOMAXIMO", "PESOMAX",
                "CAPACIDADMAXIMA", "CAPACIDADMAX", "CARGAMAXIMA", "CAPACIDAD", "PESO"]
     col_kg = next((claves[k] for k in pref_kg if k in claves), None)
@@ -307,44 +297,21 @@ def detectar_cols_tipo(df: pd.DataFrame, excluir: set) -> list:
 
 def construir_flota(df: pd.DataFrame, col_pat: str, col_kg: str, col_pal: str, cols_tipo: list) -> dict:
     d = df.copy()
-    d["_kg"] = a_numero(d[col_kg])
-    d["_pal"] = a_numero(d[col_pal])
+    d["_kg"] = a_numero(d[col_kg]) if col_kg in d else float("nan")
+    d["_pal"] = a_numero(d[col_pal]) if col_pal in d else float("nan")
     flota: dict = {}
     for _, r in d.iterrows():
         p = norm_pat(r[col_pat])
         if not re.fullmatch(r"[A-Z0-9]{6,7}", p) or p in flota:
             continue
-        partes = [norm_txt(r[c]) for c in cols_tipo]
+        partes = [norm_txt(r[c]) for c in cols_tipo if c in r]
         tipo = " | ".join(x for x in partes if x)
         flota[p] = {"kg": r["_kg"], "pal": r["_pal"], "tipo": tipo, "linea": "LINEA" in tipo}
     return flota
 
 
-def columnas_estado(df: pd.DataFrame, col_pat: str) -> list:
-    return [c for c in df.columns
-            if c != col_pat and (df[c].map(norm_txt) == "DISPONIBLE").any()]
-
-
-def columna_para_fecha(columnas: list, fecha: tuple | None):
-    """Devuelve la columna cuyo encabezado coincide con la fecha del informe (dd, mm)."""
-    if not fecha:
-        return None
-    dd, mm = fecha
-    pat_a = re.compile(rf"(?<!\d)0?{dd}[/\-.]0?{mm}(?!\d)")
-    pat_b = re.compile(rf"-0?{mm}-0?{dd}(?!\d)")
-    for c in columnas:
-        if pat_a.search(str(c)) or pat_b.search(str(c)):
-            return c
-    return None
-
-
-def fecha_desde_nombre(nombre: str):
-    m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", nombre or "")
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
-def construir_disponibles(df: pd.DataFrame, col_pat: str, col_estado: str) -> set:
-    disp = {norm_pat(p) for p, e in zip(df[col_pat], df[col_estado]) if norm_txt(e) == "DISPONIBLE"}
+def construir_disponibles_directo(df_disp_proc: pd.DataFrame) -> set:
+    disp = {r["PATENTE"] for _, r in df_disp_proc.iterrows() if r["ESTADO"] == "DISPONIBLE"}
     disp.discard("")
     return disp
 
@@ -364,7 +331,6 @@ class Ctx:
 
 
 def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tuple[str, str]]:
-    """Devuelve la lista de (severidad, detalle) de reglas rotas si la planilla `p` la cubre la patente `pat`."""
     out: list[tuple[str, str]] = []
     if not pat:
         return [("Crítico", "La planilla no tiene patente asignada.")]
@@ -374,32 +340,34 @@ def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tu
     zona, zona_o = p["zona"], p["zona_orig"] or "s/d"
     cli, ob, kg = p["cli"], p["ob"], p["kg"]
 
-    # 1) Disponibilidad ------------------------------------------------------
+    # 1) Disponibilidad
     if verificar_disp and pat not in ctx.disponibles:
         out.append(("Alto", f"Disponibilidad: la patente {pat} no figura como DISPONIBLE en el parte diario de flota."))
 
-    # 2) Capacidad física ----------------------------------------------------
+    # 2) Capacidad física
     if u is None:
         out.append(("Medio", f"Capacidad: la patente {pat} no figura en la pestaña CAMIONES, no se puede validar peso ni paletas."))
     max_kg = u["kg"] if u is not None and pd.notna(u["kg"]) else (p["cap"] if es_actual else float("nan"))
     max_pal = u["pal"] if u is not None else float("nan")
     if pd.notna(kg) and pd.notna(max_kg) and kg > max_kg:
-        out.append(("Alto", f"Sobrepeso: Kgr Truck {n(kg)} kg supera el máximo de la unidad ({n(max_kg)} kg, exceso {n(kg - max_kg)} kg)."))
+        out.append(("Alto", f"Sobrepeso: Kgr Truck {n(kg)} kg supera el máximo de la unidad ({n(max_kg)} kg)."))
     if pd.notna(ob) and pd.notna(max_pal) and ob > max_pal:
         out.append(("Alto", f"Exceso de paletas: OB {n(ob)} supera la capacidad de la unidad ({n(max_pal)} paletas)."))
 
-    # 3) Restricciones geográficas y de ruta ---------------------------------
+    # 3) Restricciones geográficas y operativas
     es_pueblo = bool(ctx.re_pueblo and ctx.re_pueblo.search(zona))
     tipo = (u["tipo"] if u is not None else "")
     if es_actual:
         tipo = f"{tipo} | {norm_txt(p['camion'])}"
 
+    # RESTRICCIÓN AG622AO
     if pat == UNIDAD_RESTRINGIDA:
         if not any(z in zona for z in ZONAS_AG622AO):
             out.append(("Crítico", f"Incumplimiento crítico: AG622AO solo puede usarse en San Justo, San Javier o Emilia/Videla y está asignada a '{zona_o}'."))
     elif es_pueblo and ctx.linea and pat not in ctx.linea:
         out.append(("Alto", f"Pueblo/ruta: la zona '{zona_o}' solo puede cubrirla una de las unidades habilitadas de línea y {pat} no lo es."))
 
+    # EXCLUSIVIDAD CENTRO
     if not es_pueblo and RE_CENTRO.search(zona) and pat not in UNIDADES_CENTRO:
         motivos = []
         if RE_BALANCIN.search(tipo):
@@ -411,17 +379,20 @@ def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tu
         if pd.notna(max_pal) and max_pal > CENTRO_MAX_OB:
             motivos.append(f"capacidad de {n(max_pal)} paletas > {CENTRO_MAX_OB}")
         if motivos:
-            out.append(("Alto", f"Centro/Puerto: es zona preferencial de AH474WT y PAP418; otra unidad solo es válida si no es balancín ni SMK/mayorista y tiene ≤ {CENTRO_MAX_OB} paletas. {pat} {'; '.join(motivos)}."))
+            out.append(("Alto", f"Centro/Puerto: zona preferencial de AH474WT y PAP418; {pat} incumple ({'; '.join(motivos)})."))
 
+    # SMK MAYORISTA
     if RE_SMK.search(zona) and pd.notna(cli) and cli < SMK_MAX_CLIENTES and pat not in POOL_SMK:
         out.append(("Alto", f"SMK Mayorista con {n(cli)} clientes (< {SMK_MAX_CLIENTES}): debe cubrirlo el pool {', '.join(sorted(POOL_SMK))}."))
 
+    # CAMIONES DE GAS
     if pat in UNIDADES_GAS and not (pd.notna(cli) and cli < GAS_EXCEPCION_CLI):
         if pd.notna(cli) and cli > GAS_MAX_CLI:
             out.append(("Alto", f"Camión de gas: {n(cli)} clientes supera el máximo de {GAS_MAX_CLI}."))
         if pd.notna(ob) and ob > GAS_MAX_OB:
             out.append(("Alto", f"Camión de gas: OB {n(ob)} supera el máximo de {GAS_MAX_OB} paletas."))
 
+    # CABLES BAJOS
     if pat in CABLES_BAJOS_PROHIBIDAS:
         hits = [nom for nom, rx in ZONAS_CABLES_BAJOS.items() if re.search(rx, zona)]
         if hits:
@@ -452,8 +423,6 @@ def sugerir(i: int, planillas: list[dict], ocup: dict, ctx: Ctx, max_alt: int = 
             pl = ", ".join(planillas[j]["planilla"] for j in ocup_o)
             cands.append((2, u["pal"], u["kg"], f"{cand} · libre en {v}ª vuelta (ocupada en {otra}ª, planilla {pl}) · {info}"))
         else:
-            # Enroque: la candidata está en otra planilla de la misma vuelta; solo se propone si
-            # la unidad actual cumple todas las reglas en esa otra planilla.
             if len(ocup_v) == 1 and p["patente"]:
                 q = planillas[ocup_v[0]]
                 if not evaluar(q, p["patente"], ctx, verificar_disp=False) and p["patente"] in ctx.disponibles:
@@ -462,7 +431,7 @@ def sugerir(i: int, planillas: list[dict], ocup: dict, ctx: Ctx, max_alt: int = 
                                   f"donde {p['patente']} sí cumple · {info}"))
     if not cands:
         return "Sin alternativas válidas en la flota disponible."
-    cands.sort(key=lambda x: (x[0], x[1], x[2]))  # prioridad, y la unidad más ajustada primero
+    cands.sort(key=lambda x: (x[0], x[1], x[2]))
     return " | ".join(f"{k}) {c[3]}" for k, c in enumerate(cands[:max_alt], 1))
 
 
@@ -485,7 +454,7 @@ def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
                 otras = ", ".join(planillas[j]["planilla"] for j in dup if j != i)
                 probs.append(("Medio", f"Doble asignación: la patente también está en la/s planilla/s {otras} de la misma vuelta."))
             alt = sugerir(i, planillas, ocup, ctx) if probs else ""
-        except Exception as e:  # una fila problemática no debe tumbar toda la auditoría
+        except Exception as e:
             probs, alt = [("Medio", f"No se pudo auditar la planilla: {e}")], ""
 
         sev = min((s for s, _ in probs), key=lambda s: ORDEN_SEVERIDAD[s]) if probs else ""
@@ -550,7 +519,7 @@ def estilo_estado(d: pd.DataFrame):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# INTERFAZ
+# INTERFAZ (UI STREAMLIT)
 # ════════════════════════════════════════════════════════════════════════════
 def main():
     st.set_page_config(page_title="Auditoría de Flota · Quilmes Santa Fe", page_icon="🚛", layout="wide")
@@ -562,163 +531,7 @@ def main():
         type=["xlsx", "xlsm"], key="informe",
     )
 
-    # ── Sidebar: base de flota ───────────────────────────────────────────────
     with st.sidebar:
         st.header("Base de flota")
         if st.button("🔄 Actualizar Flota desde Google Sheets"):
             descargar_flota.clear()
-            st.rerun()
-        flota_manual = st.file_uploader(
-            "…o subí el archivo de flota manualmente (si falla la red)", type=["xlsx", "xlsm"], key="flota_manual"
-        )
-
-    contenido, origen = None, ""
-    if flota_manual is not None:
-        contenido, origen = flota_manual.getvalue(), f"archivo manual ({flota_manual.name})"
-    else:
-        try:
-            contenido, ts = descargar_flota(URL_FLOTA)
-            origen = f"Google Sheets · descargado {ts:%d/%m %H:%M}"
-        except Exception as e:
-            st.sidebar.error(f"No se pudo descargar la flota: {e}")
-
-    if contenido is None:
-        st.warning("No hay base de flota disponible. Subí el archivo de flota manualmente en la barra lateral.")
-        st.stop()
-
-    try:
-        df_cam, df_disp = parsear_flota(contenido)
-    except Exception as e:
-        st.error(f"No se pudo leer la base de flota: {e}")
-        st.stop()
-
-    st.sidebar.success(f"Flota cargada desde {origen}")
-
-    cols = detectar_cols_camiones(df_cam)
-    col_pat_disp = next((c for c in df_disp.columns if clave(c) in CLAVES_PATENTE), None)
-    cand_estado = columnas_estado(df_disp, col_pat_disp) if col_pat_disp else []
-    fecha = fecha_desde_nombre(informe_file.name) if informe_file else None
-    col_estado_def = columna_para_fecha(cand_estado, fecha) or (cand_estado[-1] if cand_estado else None)
-
-    with st.sidebar:
-        with st.expander("Mapeo de columnas de flota (avanzado)"):
-            todas = list(df_cam.columns)
-
-            def sel(etiqueta, valor, opciones):
-                idx = opciones.index(valor) if valor in opciones else 0
-                return st.selectbox(etiqueta, opciones, index=idx)
-
-            if not todas:
-                st.error("La pestaña CAMIONES no tiene columnas.")
-                st.stop()
-            col_pat = sel("CAMIONES · Patente", cols["patente"], todas)
-            col_kg = sel("CAMIONES · Peso máximo (kg)", cols["kg"], todas)
-            col_pal = sel("CAMIONES · Paletas máx. (columna P)", cols["pal"], todas)
-            if cand_estado:
-                col_estado = sel("Disponibilidad · columna del día", col_estado_def, cand_estado)
-            else:
-                col_estado = None
-
-        st.header("Reglas configurables")
-        cols_tipo = detectar_cols_tipo(df_cam, {col_pat, col_kg, col_pal})
-        flota = construir_flota(df_cam, col_pat, col_kg, col_pal, cols_tipo)
-        linea_auto = sorted(p for p, u in flota.items() if u["linea"])
-        linea_txt = st.text_area(
-            "Patentes de flota de línea (las 11 habilitadas)", value=", ".join(linea_auto),
-            help="Se autocompleta si CAMIONES indica 'Línea' en alguna columna de tipo. Editá la lista si hace falta.",
-        )
-        linea = {norm_pat(x) for x in parsear_lista(linea_txt)}
-        if not linea:
-            st.warning("Sin patentes de línea cargadas: la regla de pueblos/rutas queda desactivada.")
-        elif len(linea) != 11:
-            st.warning(f"Hay {len(linea)} patentes de línea cargadas (se esperaban 11).")
-        pueblos_txt = st.text_area("Zonas consideradas pueblo/ruta", value=", ".join(PUEBLOS_DEFAULT))
-        pueblos = parsear_lista(pueblos_txt)
-
-    if col_estado is None:
-        st.error(
-            "En 'Disponibilidad flota Diaria' no se encontró ninguna columna con el estado 'DISPONIBLE'. "
-            f"Columnas detectadas: {', '.join(map(str, df_disp.columns))}"
-        )
-        st.stop()
-    if not flota:
-        st.error("No se pudo construir la flota desde CAMIONES. Revisá el mapeo de columnas en la barra lateral.")
-        st.stop()
-
-    disponibles = construir_disponibles(df_disp, col_pat_disp, col_estado)
-    sin_datos = sorted(disponibles - set(flota))
-    ctx = Ctx(flota, disponibles, linea, pueblos)
-
-    if informe_file is None:
-        st.info("Cargá el Informe de Entrega para iniciar la auditoría.")
-        st.stop()
-
-    try:
-        df, avisos = cargar_informe(informe_file)
-    except Exception as e:
-        st.error(f"No se pudo procesar el informe: {e}")
-        st.stop()
-    for a in avisos:
-        st.warning(a)
-    if sin_datos:
-        st.warning(f"Disponibles sin datos en CAMIONES (no se proponen como alternativa): {', '.join(sin_datos)}")
-
-    with st.spinner("Auditando planillas…"):
-        res = auditar(df, ctx)
-        libres = unidades_libres(ctx, df)
-
-    total = len(res)
-    n_inc = int((res["Estado"] == "INCUMPLE").sum())
-    sin_asignar = int((libres["Disponibilidad"] == "Libre 1ª y 2ª vuelta").sum())
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Planillas procesadas", total)
-    k2.metric("Planillas OK", total - n_inc)
-    k3.metric("Con incumplimiento", n_inc)
-    k4.metric("Unidades disponibles sin asignar", sin_asignar)
-    st.caption(f"Flota: {origen} · {len(ctx.disponibles)} unidades DISPONIBLES · columna de estado: {col_estado}")
-
-    tab_alertas, tab_audit, tab_libres = st.tabs(["🚨 Alertas e incumplimientos", "📋 Auditoría completa", "🟢 Unidades libres"])
-
-    cols_alerta = ["Planilla", "Vuelta", "Camión", "Patente", "Zona", "Clientes", "Paletas (OB)", "Peso (Kg)",
-                   "Incumplimiento Detectado", "Alternativas Sugeridas"]
-    cfg = {
-        "Incumplimiento Detectado": st.column_config.TextColumn(width="large"),
-        "Alternativas Sugeridas": st.column_config.TextColumn(width="large"),
-    }
-
-    with tab_alertas:
-        alertas = res[res["Estado"] == "INCUMPLE"].copy()
-        if alertas.empty:
-            st.success("✅ Todas las planillas cumplen las reglas operativas.")
-        else:
-            f1, f2 = st.columns(2)
-            sevs = f1.multiselect("Severidad", ["Crítico", "Alto", "Medio"], default=["Crítico", "Alto", "Medio"])
-            vueltas = f2.multiselect("Vuelta", sorted(alertas["Vuelta"].unique()), default=sorted(alertas["Vuelta"].unique()))
-            alertas = alertas[alertas["Severidad"].isin(sevs) & alertas["Vuelta"].isin(vueltas)]
-            alertas = alertas.sort_values("Severidad", key=lambda s: s.map(ORDEN_SEVERIDAD), kind="stable")
-            st.caption(f"{len(alertas)} planilla(s) con desvíos. Ordenadas por severidad.")
-            st.dataframe(alertas[["Severidad"] + cols_alerta], hide_index=True, column_config=cfg)
-
-    with tab_audit:
-        st.dataframe(estilo_estado(res), hide_index=True, column_config=cfg)
-        excel = a_excel({
-            "Auditoría completa": res,
-            "Alertas": res[res["Estado"] == "INCUMPLE"],
-            "Unidades libres": libres,
-        })
-        st.download_button(
-            "⬇️ Descargar auditoría en Excel", data=excel,
-            file_name=f"auditoria_flota_{datetime.now():%Y%m%d_%H%M}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    with tab_libres:
-        if libres.empty:
-            st.info("No quedan unidades disponibles libres en ninguna vuelta.")
-        else:
-            st.dataframe(libres, hide_index=True)
-
-
-if __name__ == "__main__":
-    main()
