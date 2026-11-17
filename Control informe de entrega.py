@@ -2,6 +2,9 @@
 """
 Tablero de Auditoría y Control de Asignación de Flota
 Cervecería Quilmes · Operación Santa Fe
+
+Ejecutar:    streamlit run "Control informe de entrega.py"
+Requiere:    pip install streamlit pandas openpyxl requests
 """
 from __future__ import annotations
 
@@ -144,7 +147,7 @@ def parsear_lista(texto: str) -> list[str]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# CARGA DE DATOS SEGURA
+# CARGA DE DATOS Y PROCESAMIENTO
 # ════════════════════════════════════════════════════════════════════════════
 def mapear_columnas(columnas, alias: dict) -> dict:
     claves: dict = {}
@@ -246,9 +249,11 @@ def detectar_cols_camiones(df: pd.DataFrame) -> dict:
     col_kg = next((claves[k] for k in ["CAPACIDADKG", "CAPKG", "KG", "KGS", "KILOS", "PESOMAXIMO"] if k in claves), df.columns[2] if len(df.columns) > 2 else None)
     return {"patente": col_pat, "kg": col_kg, "pal": col_pal}
 
+
 def detectar_cols_tipo(df: pd.DataFrame, excluir: set) -> list:
     pistas = ("TIPO", "CAMION", "CATEG", "MODELO", "DESCRIP", "LINEA", "CLASE", "VEHICULO", "TRUCK")
     return [c for c in df.columns if c not in excluir and any(p in clave(c) for p in pistas)]
+
 
 def construir_flota(df: pd.DataFrame, col_pat: str, col_kg: str, col_pal: str, cols_tipo: list) -> dict:
     d = df.copy()
@@ -309,9 +314,19 @@ def main():
     with st.sidebar:
         with st.expander("Mapeo de columnas"):
             todas = list(df_cam.columns)
-            col_pat = st.selectbox("Patente (Col. B)", cols["patente"] if cols["patente"] in todas else todas[0], todas)
-            col_kg = st.selectbox("Peso máximo (kg)", cols["kg"] if cols["kg"] in todas else todas[0], todas)
-            col_pal = st.selectbox("Paletas máx. (Col. P)", cols["pal"] if cols["pal"] in todas else (todas[15] if len(todas) > 15 else todas[0]), todas)
+            
+            def_pat = cols["patente"] if cols["patente"] in todas else todas[0]
+            idx_pat = todas.index(def_pat) if def_pat in todas else 0
+            
+            def_kg = cols["kg"] if cols["kg"] in todas else todas[0]
+            idx_kg = todas.index(def_kg) if def_kg in todas else 0
+            
+            def_pal = cols["pal"] if cols["pal"] in todas else (todas[15] if len(todas) > 15 else todas[0])
+            idx_pal = todas.index(def_pal) if def_pal in todas else 0
+
+            col_pat = st.selectbox("Patente (Col. B)", todas, index=idx_pat)
+            col_kg = st.selectbox("Peso máximo (kg)", todas, index=idx_kg)
+            col_pal = st.selectbox("Paletas máx. (Col. P)", todas, index=idx_pal)
 
         cols_tipo = detectar_cols_tipo(df_cam, {col_pat, col_kg, col_pal})
         flota = construir_flota(df_cam, col_pat, col_kg, col_pal, cols_tipo)
@@ -320,7 +335,6 @@ def main():
 
     disponibles = {r["PATENTE"] for _, r in df_disp_proc.iterrows() if r["ESTADO"] == "DISPONIBLE"}
     disponibles.discard("")
-    ctx = __import__('types').SimpleNamespace(flota=flota, disponibles=disponibles, linea=linea, re_pueblo=re.compile(r"\b(?:" + "|".join(map(re.escape, PUEBLOS_DEFAULT)) + r")\b"))
 
     if informe_file is None:
         st.info("👆 Carga el archivo Informe de Entrega arriba para iniciar la auditoría.")
@@ -332,11 +346,9 @@ def main():
         st.error(f"Error al procesar el informe de entregas: {e}")
         st.stop()
 
-    # Importamos las funciones de auditoría del script previo de forma segura
-    from types import ModuleType
-    # Procesamiento completado con éxito
     st.success(f"¡Informe procesado correctamente! Flota activa: {origen}")
     st.dataframe(df.head(10))
 
 if __name__ == "__main__":
     main()
+    
