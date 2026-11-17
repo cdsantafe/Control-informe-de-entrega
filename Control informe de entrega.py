@@ -432,6 +432,40 @@ def unidades_libres(ctx: Ctx, df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(filas, columns=["Patente", "Disponibilidad", "Paletas máx.", "Peso máx. (Kg)", "Línea", "Tipo"])
 
 
+def obtener_patentes_duplicadas(df: pd.DataFrame) -> pd.DataFrame:
+    dup_filas = []
+    for vuelta in [1, 2]:
+        sub = df[df["vuelta"] == vuelta]
+        for pat, grupo in sub.groupby("patente"):
+            if pat and len(grupo) > 1:
+                planillas_str = ", ".join(grupo["planilla"].astype(str))
+                zonas_str = " / ".join(grupo["zona_orig"].astype(str))
+                dup_filas.append({
+                    "Vuelta": vuelta,
+                    "Patente": pat,
+                    "Cantidad Planillas": len(grupo),
+                    "Planillas": planillas_str,
+                    "Zonas": zonas_str
+                })
+    return pd.DataFrame(dup_filas)
+
+
+def patentes_disponibles_sin_utilizar(ctx: Ctx, df: pd.DataFrame) -> pd.DataFrame:
+    usadas_todas = set(df["patente"].dropna())
+    sin_usar = sorted(ctx.disponibles - usadas_todas)
+    filas = []
+    for pat in sin_usar:
+        u = ctx.flota.get(pat, {})
+        filas.append({
+            "Patente": pat,
+            "Paletas máx.": u.get("pal", float("nan")),
+            "Peso máx. (Kg)": u.get("kg", float("nan")),
+            "Línea": "Sí" if pat in ctx.linea else "No",
+            "Tipo": u.get("tipo", ""),
+        })
+    return pd.DataFrame(filas)
+
+
 def a_excel(hojas: dict) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -595,7 +629,32 @@ def main():
         else:
             st.dataframe(libres, hide_index=True)
 
+    # ════════════════════════════════════════════════════════════════════════
+    # SECCIONES ADICIONALES ABAJO (Duplicadas y Disponibles sin utilizar)
+    # ════════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("📌 Resumen Operativo Adicional")
+
+    col_izq, col_der = st.columns(2)
+
+    with col_izq:
+        st.markdown("### 🪞 Patentes Duplicadas en el Informe")
+        df_dups = obtener_patentes_duplicadas(df)
+        if df_dups.empty:
+            st.success("No se detectaron patentes duplicadas en la misma vuelta.")
+        else:
+            st.warning(f"Se encontraron {len(df_dups)} patente(s) asignadas a múltiples planillas en una misma vuelta.")
+            st.dataframe(df_dups, hide_index=True)
+
+    with col_der:
+        st.markdown("### 🟢 Patentes Disponibles Sin Utilizar (100% Libres)")
+        df_sin_usar = patentes_disponibles_sin_utilizar(ctx, df)
+        if df_sin_usar.empty:
+            st.info("Todas las unidades disponibles fueron utilizadas al menos en una planilla.")
+        else:
+            st.success(f"{len(df_sin_usar)} unidades disponibles no fueron asignadas en todo el día.")
+            st.dataframe(df_sin_usar, hide_index=True)
+
 
 if __name__ == "__main__":
     main()
-    
