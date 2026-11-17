@@ -20,7 +20,7 @@ import streamlit as st
 st.set_page_config(page_title="Auditoría de Flota · Quilmes Santa Fe", page_icon="🚛", layout="wide")
 
 # ════════════════════════════════════════════════════════════════════════════
-# CONSTANTES Y CONFIGURACIÓN INICIAL
+# CONSTANTES DE NEGOCIO Y REGLAS
 # ════════════════════════════════════════════════════════════════════════════
 URL_FLOTA = (
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vRlajPJLs9j3Kl6WU0-xb7xxuPfV1jLwgp3tYSMBerrkqmZHHwnTnriwHKlliGjH2gKDNwBOycnUJRo/pub?output=xlsx"
@@ -84,7 +84,7 @@ NOMBRES_LEGIBLES = {
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# UTILIDADES
+# UTILIDADES DE TEXTO Y NÚMEROS
 # ════════════════════════════════════════════════════════════════════════════
 def norm_txt(s) -> str:
     if s is None or (not isinstance(s, str) and pd.isna(s)):
@@ -147,7 +147,7 @@ def parsear_lista(texto: str) -> list[str]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# CARGA DE DATOS Y PROCESAMIENTO
+# CARGA Y PARSEO DE ARCHIVOS
 # ════════════════════════════════════════════════════════════════════════════
 def mapear_columnas(columnas, alias: dict) -> dict:
     claves: dict = {}
@@ -230,8 +230,8 @@ def parsear_flota(contenido: bytes):
     raw_disp = xl.parse(h_disp, header=None, dtype=object).dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
     df_disp_proc = pd.DataFrame()
     if raw_disp.shape[1] >= 10:
-        df_disp_proc["PATENTE"] = raw_disp.iloc[:, 4].map(norm_pat)
-        df_disp_proc["ESTADO"] = raw_disp.iloc[:, 9].map(norm_txt)
+        df_disp_proc["PATENTE"] = raw_disp.iloc[:, 4].map(norm_pat)  # Columna E
+        df_disp_proc["ESTADO"] = raw_disp.iloc[:, 9].map(norm_txt)   # Columna J
     else:
         df_disp_proc["PATENTE"] = raw_disp.iloc[:, 0].map(norm_pat)
         df_disp_proc["ESTADO"] = raw_disp.iloc[:, 1].map(norm_txt)
@@ -271,7 +271,191 @@ def construir_flota(df: pd.DataFrame, col_pat: str, col_kg: str, col_pal: str, c
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# INTERFAZ PRINCIPAL
+# MOTOR DE REGLAS Y AUDITORÍA
+# ════════════════════════════════════════════════════════════════════════════
+class Ctx:
+    def __init__(self, flota: dict, disponibles: set, linea: set, pueblos: list[str]):
+        self.flota = flota
+        self.disponibles = disponibles
+        self.linea = linea
+        pueblos_n = [norm_txt(p) for p in pueblos if norm_txt(p)]
+        self.re_pueblo = (
+            re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pueblos_n) + r")\b") if pueblos_n else None
+        )
+
+
+def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    if not pat:
+        return [("Crítico", "La planilla no tiene patente asignada.")]
+
+    u = ctx.flota.get(pat)
+    es_actual = pat == p["patente"]
+    zona, zona_o = p["zona"], p["zona_orig"] or "s/d"
+    cli, ob, kg = p["cli"], p["ob"], p["kg"]
+
+    # 1) Disponibilidad
+    if verificar_disp and pat not in ctx.disponibles:
+        out.append(("Alto", f"Disponibilidad: la patente {pat} no figura como DISPONIBLE en el parte diario."))
+
+    # 2) Capacidad física
+    if u is None:
+        out.append(("Medio", f"Capacidad: la patente {pat} no figura en CAMIONES."))
+    max_kg = u["kg"] if u is not None and pd.notna(u["kg"]) else (p["cap"] if es_actual else float("nan"))
+    max_pal = u["pal"] if u is not None else float("nan")
+    if pd.notna(kg) and pd.notna(max_kg) and kg > max_kg:
+        out.append(("Alto", f"Sobrepeso: Kgr Truck {n(kg)} kg supera el máximo de la unidad ({n(max_kg)} kg)."))
+    if pd.notna(ob) and pd.notna(max_pal) and ob > max_pal:
+        out.append(("Alto", f"Exceso de paletas: OB {n(ob)} supera la capacidad ({n(max_pal)} paletas)."))
+
+    # 3) Restricciones geográficas y de ruta
+    es_pueblo = bool(ctx.re_pueblo and ctx.re_pueblo.search(zona))
+    tipo = (u["tipo"] if u is not None else "")
+    if es_actual:
+        tipo = f"{tipo} | {norm_txt(p['camion'])}"
+
+    if pat == UNIDAD_RESTRINGIDA:
+        if not any(z in zona for z in ZONAS_AG622AO):
+            out.append(("Crítico", f"Incumplimiento crítico: AG622AO solo puede usarse en San Justo, San Javier, Emilia o Videla (asignada a '{zona_o}')."))
+    elif es_pueblo and ctx.linea and pat not in ctx.linea:
+        out.append(("Alto", f"Pueblo/ruta: la zona '{zona_o}' solo puede cubrirla una unidad habilitada de línea."))
+
+    if not es_pueblo and RE_CENTRO.search(zona) and pat not in UNIDADES_CENTRO:
+        motivos = []
+        if RE_BALANCIN.search(tipo): motivos.append("es camión balancín")
+        if RE_SMK.search(tipo): motivos.append("es camión SMK/mayorista")
+        if pd.notna(ob) and ob > CENTRO_MAX_OB: motivos.append(f"OB {n(ob)} > {CENTRO_MAX_OB}")
+        if motivos:
+            out.append(("Alto", f"Centro/Puerto: zona preferencial de AH474WT y PAP418 ({'; '.join(motivos)})."))
+
+    if RE_SMK.search(zona) and pd.notna(cli) and cli < SMK_MAX_CLIENTES and pat not in POOL_SMK:
+        out.append(("Alto", f"SMK Mayorista con {n(cli)} clientes (< {SMK_MAX_CLIENTES}): debe cubrirlo el pool."))
+
+    if pat in UNIDADES_GAS and not (pd.notna(cli) and cli < GAS_EXCEPCION_CLI):
+        if pd.notna(cli) and cli > GAS_MAX_CLI:
+            out.append(("Alto", f"Camión de gas: {n(cli)} clientes supera el máximo de {GAS_MAX_CLI}."))
+        if pd.notna(ob) and ob > GAS_MAX_OB:
+            out.append(("Alto", f"Camión de gas: OB {n(ob)} supera el máximo de {GAS_MAX_OB}."))
+
+    if pat in CABLES_BAJOS_PROHIBIDAS:
+        hits = [nom for nom, rx in ZONAS_CABLES_BAJOS.items() if re.search(rx, zona)]
+        if hits:
+            out.append(("Alto", f"Cables bajos: zona '{zona_o}' ({', '.join(hits)}) prohíbe la unidad {pat}."))
+
+    return out
+
+
+def sugerir(i: int, planillas: list[dict], ocup: dict, ctx: Ctx, max_alt: int = 3) -> str:
+    p = planillas[i]
+    v, otra = p["vuelta"], (2 if p["vuelta"] == 1 else 1)
+    cands = []
+    for cand in ctx.disponibles:
+        u = ctx.flota.get(cand)
+        if cand == p["patente"] or u is None or pd.isna(u["kg"]) or pd.isna(u["pal"]):
+            continue
+        if evaluar(p, cand, ctx, verificar_disp=False):
+            continue
+        ocup_v = ocup[v].get(cand, [])
+        ocup_o = ocup[otra].get(cand, [])
+        info = f"{n(u['pal'])} pal / {n(u['kg'])} kg"
+        if not ocup_v and not ocup_o:
+            cands.append((1, u["pal"], u["kg"], f"{cand} · 100% libre · {info}"))
+        elif not ocup_v:
+            pl = ", ".join(planillas[j]["planilla"] for j in ocup_o)
+            cands.append((2, u["pal"], u["kg"], f"{cand} · libre en {v}ª vuelta (ocupada en {otra}ª, planilla {pl}) · {info}"))
+        else:
+            if len(ocup_v) == 1 and p["patente"]:
+                q = planillas[ocup_v[0]]
+                if not evaluar(q, p["patente"], ctx, verificar_disp=False) and p["patente"] in ctx.disponibles:
+                    cands.append((3, u["pal"], u["kg"], f"{cand} · enroque con planilla {q['planilla']} · {info}"))
+    if not cands:
+        return "Sin alternativas válidas."
+    cands.sort(key=lambda x: (x[0], x[1], x[2]))
+    return " | ".join(f"{k}) {c[3]}" for k, c in enumerate(cands[:max_alt], 1))
+
+
+def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
+    planillas = df.to_dict("records")
+    ocup: dict = {1: {}, 2: {}}
+    for i, p in enumerate(planillas):
+        if p["patente"]:
+            ocup[p["vuelta"]].setdefault(p["patente"], []).append(i)
+
+    filas = []
+    for i, p in enumerate(planillas):
+        try:
+            probs = evaluar(p, p["patente"], ctx)
+            dup = ocup[p["vuelta"]].get(p["patente"], [])
+            if p["patente"] and len(dup) > 1:
+                otras = ", ".join(planillas[j]["planilla"] for j in dup if j != i)
+                probs.append(("Medio", f"Doble asignación: la patente también está en planilla/s {otras}."))
+            alt = sugerir(i, planillas, ocup, ctx) if probs else ""
+        except Exception as e:
+            probs, alt = [("Medio", f"Error en auditoría: {e}")], ""
+
+        sev = min((s for s, _ in probs), key=lambda s: ORDEN_SEVERIDAD[s]) if probs else ""
+        u = ctx.flota.get(p["patente"])
+        camion = p["camion"] or (u["tipo"].split(" | ")[0] if u and u["tipo"] else "")
+        filas.append({
+            "Planilla": p["planilla"],
+            "Vuelta": p["vuelta"],
+            "Camión": camion,
+            "Patente": p["patente"],
+            "Zona": p["zona_orig"],
+            "Clientes": p["cli"],
+            "Paletas (OB)": p["ob"],
+            "Peso (Kg)": p["kg"],
+            "Estado": "INCUMPLE" if probs else "OK",
+            "Severidad": sev,
+            "Incumplimiento Detectado": " ‖ ".join(f"{k}) {t}" for k, (_, t) in enumerate(probs, 1)),
+            "Alternativas Sugeridas": alt,
+        })
+    return pd.DataFrame(filas)
+
+
+def unidades_libres(ctx: Ctx, df: pd.DataFrame) -> pd.DataFrame:
+    usadas = {1: set(df.loc[df["vuelta"] == 1, "patente"]), 2: set(df.loc[df["vuelta"] == 2, "patente"])}
+    filas = []
+    for pat in sorted(ctx.disponibles):
+        l1, l2 = pat not in usadas[1], pat not in usadas[2]
+        if not (l1 or l2):
+            continue
+        u = ctx.flota.get(pat, {})
+        filas.append({
+            "Patente": pat,
+            "Disponibilidad": "Libre 1ª y 2ª vuelta" if (l1 and l2) else ("Libre solo 1ª vuelta" if l1 else "Libre solo 2ª vuelta"),
+            "Paletas máx.": u.get("pal", float("nan")),
+            "Peso máx. (Kg)": u.get("kg", float("nan")),
+            "Línea": "Sí" if pat in ctx.linea else "No",
+            "Tipo": u.get("tipo", ""),
+        })
+    return pd.DataFrame(filas, columns=["Patente", "Disponibilidad", "Paletas máx.", "Peso máx. (Kg)", "Línea", "Tipo"])
+
+
+def a_excel(hojas: dict) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for nombre, d in hojas.items():
+            nombre = nombre[:31]
+            d.to_excel(w, sheet_name=nombre, index=False)
+            ws = w.sheets[nombre]
+            ws.freeze_panes = "A2"
+            for col in ws.columns:
+                ancho = max(len(str(c.value)) if c.value is not None else 0 for c in col[:200]) + 2
+                ws.column_dimensions[col[0].column_letter].width = min(max(ancho, 8), 70)
+    return buf.getvalue()
+
+
+def estilo_estado(d: pd.DataFrame):
+    def color(v):
+        return {"OK": "background-color:#d9f2e0;color:#14532d",
+                "INCUMPLE": "background-color:#fde2e2;color:#7f1d1d"}.get(v, "")
+    sty = d.style
+    return sty.map(color, subset=["Estado"]) if hasattr(sty, "map") else sty.applymap(color, subset=["Estado"])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# INTERFAZ PRINCIPAL (STREAMLIT)
 # ════════════════════════════════════════════════════════════════════════════
 def main():
     st.title("🚛 Tablero de Auditoría y Control de Asignación de Flota")
@@ -332,9 +516,13 @@ def main():
         flota = construir_flota(df_cam, col_pat, col_kg, col_pal, cols_tipo)
         linea_txt = st.text_area("Flota de línea", value=", ".join(sorted(p for p, u in flota.items() if u["linea"])))
         linea = {norm_pat(x) for x in parsear_lista(linea_txt)}
+        pueblos_txt = st.text_area("Zonas consideradas pueblo/ruta", value=", ".join(PUEBLOS_DEFAULT))
+        pueblos = parsear_lista(pueblos_txt)
 
     disponibles = {r["PATENTE"] for _, r in df_disp_proc.iterrows() if r["ESTADO"] == "DISPONIBLE"}
     disponibles.discard("")
+    sin_datos = sorted(disponibles - set(flota))
+    ctx = Ctx(flota, disponibles, linea, pueblos)
 
     if informe_file is None:
         st.info("👆 Carga el archivo Informe de Entrega arriba para iniciar la auditoría.")
@@ -345,9 +533,68 @@ def main():
     except Exception as e:
         st.error(f"Error al procesar el informe de entregas: {e}")
         st.stop()
+        
+    for a in avisos:
+        st.warning(a)
+    if sin_datos:
+        st.warning(f"Disponibles sin datos en CAMIONES: {', '.join(sin_datos)}")
 
-    st.success(f"¡Informe procesado correctamente! Flota activa: {origen}")
-    st.dataframe(df.head(10))
+    with st.spinner("Auditando planillas y cruzando reglas logísticas..."):
+        res = auditar(df, ctx)
+        libres = unidades_libres(ctx, df)
+
+    total = len(res)
+    n_inc = int((res["Estado"] == "INCUMPLE").sum())
+    sin_asignar = int((libres["Disponibilidad"] == "Libre 1ª y 2ª vuelta").sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Planillas procesadas", total)
+    k2.metric("Planillas OK", total - n_inc)
+    k3.metric("Con incumplimiento", n_inc)
+    k4.metric("Unidades libres", sin_asignar)
+    st.caption(f"Flota: {origen} · {len(ctx.disponibles)} unidades DISPONIBLES")
+
+    tab_alertas, tab_audit, tab_libres = st.tabs(["🚨 Alertas e incumplimientos", "📋 Auditoría completa", "🟢 Unidades libres"])
+
+    cols_alerta = ["Planilla", "Vuelta", "Camión", "Patente", "Zona", "Clientes", "Paletas (OB)", "Peso (Kg)",
+                   "Incumplimiento Detectado", "Alternativas Sugeridas"]
+    cfg = {
+        "Incumplimiento Detectado": st.column_config.TextColumn(width="large"),
+        "Alternativas Sugeridas": st.column_config.TextColumn(width="large"),
+    }
+
+    with tab_alertas:
+        alertas = res[res["Estado"] == "INCUMPLE"].copy()
+        if alertas.empty:
+            st.success("✅ ¡Excelente! Todas las planillas cumplen las reglas operativas sin desvíos.")
+        else:
+            f1, f2 = st.columns(2)
+            sevs = f1.multiselect("Severidad", ["Crítico", "Alto", "Medio"], default=["Crítico", "Alto", "Medio"])
+            vueltas = f2.multiselect("Vuelta", sorted(alertas["Vuelta"].unique()), default=sorted(alertas["Vuelta"].unique()))
+            alertas = alertas[alertas["Severidad"].isin(sevs) & alertas["Vuelta"].isin(vueltas)]
+            alertas = alertas.sort_values("Severidad", key=lambda s: s.map(ORDEN_SEVERIDAD), kind="stable")
+            st.caption(f"{len(alertas)} planilla(s) con desvíos detectados.")
+            st.dataframe(alertas[["Severidad"] + cols_alerta], hide_index=True, column_config=cfg)
+
+    with tab_audit:
+        st.dataframe(estilo_estado(res), hide_index=True, column_config=cfg)
+        excel = a_excel({
+            "Auditoría completa": res,
+            "Alertas": res[res["Estado"] == "INCUMPLE"],
+            "Unidades libres": libres,
+        })
+        st.download_button(
+            "⬇️ Descargar auditoría completa en Excel", data=excel,
+            file_name=f"auditoria_flota_{datetime.now():%Y%m%d_%H%M}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    with tab_libres:
+        if libres.empty:
+            st.info("No quedan unidades disponibles libres en ninguna vuelta.")
+        else:
+            st.dataframe(libres, hide_index=True)
+
 
 if __name__ == "__main__":
     main()
