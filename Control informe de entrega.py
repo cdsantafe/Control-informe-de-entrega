@@ -15,6 +15,7 @@ from datetime import datetime
 
 import pandas as pd
 import requests
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 import streamlit as st
 
@@ -485,12 +486,13 @@ def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
         try:
             probs = evaluar(p, p["patente"], ctx)
             dup = ocup[p["vuelta"]].get(p["patente"], [])
+            dup_txt = ""
             if p["patente"] and len(dup) > 1:
                 otras = ", ".join(planillas[j]["planilla"] for j in dup if j != i)
-                probs.append(("Medio", f"Doble asignación: la patente también está en la/s planilla/s {otras} de la misma vuelta."))
-            alt = sugerir(i, planillas, ocup, ctx) if probs else ""
+                dup_txt = f"{p['patente']} también está en la/s planilla/s {otras} de la {p['vuelta']}ª vuelta."
+            alt = sugerir(i, planillas, ocup, ctx) if (probs or dup_txt) else ""
         except Exception as e:  # una fila problemática no debe tumbar toda la auditoría
-            probs, alt = [("Medio", f"No se pudo auditar la planilla: {e}")], ""
+            probs, dup_txt, alt = [("Medio", f"No se pudo auditar la planilla: {e}")], "", ""
 
         sev = min((s for s, _ in probs), key=lambda s: ORDEN_SEVERIDAD[s]) if probs else ""
         u = ctx.flota.get(p["patente"])
@@ -504,12 +506,18 @@ def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
             "Clientes": p["cli"],
             "Paletas (OB)": p["ob"],
             "Peso (Kg)": p["kg"],
-            "Estado": "INCUMPLE" if probs else "OK",
+            "Estado": "INCUMPLE" if probs else ("PATENTE DUPLICADA" if dup_txt else "OK"),
             "Severidad": sev,
             "Incumplimiento Detectado": " ‖ ".join(f"{k}) {t}" for k, (_, t) in enumerate(probs, 1)),
+            "Duplicación de Patente": dup_txt,
             "Alternativas Sugeridas": alt,
         })
-    return pd.DataFrame(filas)
+    out = pd.DataFrame(filas)
+    # Formatos: clientes y kg en unidades enteras, OB con 1 decimal
+    out["Clientes"] = pd.to_numeric(out["Clientes"], errors="coerce").round(0).astype("Int64")
+    out["Peso (Kg)"] = pd.to_numeric(out["Peso (Kg)"], errors="coerce").round(0).astype("Int64")
+    out["Paletas (OB)"] = pd.to_numeric(out["Paletas (OB)"], errors="coerce").round(1)
+    return out
 
 
 def unidades_libres(ctx: Ctx, df: pd.DataFrame) -> pd.DataFrame:
@@ -556,18 +564,38 @@ def a_excel(hojas: dict) -> bytes:
             d.to_excel(w, sheet_name=nombre, index=False)
             ws = w.sheets[nombre]
             ws.freeze_panes = "A2"
+            cabeceras = {c.value: c.column for c in ws[1]}
+            for col_nombre, fmt in {"Clientes": "0", "Paletas (OB)": "0.0", "Peso (Kg)": "0"}.items():
+                if col_nombre in cabeceras:
+                    for fila in ws.iter_rows(min_row=2, min_col=cabeceras[col_nombre], max_col=cabeceras[col_nombre]):
+                        fila[0].number_format = fmt
+            if "Estado" in cabeceras:
+                relleno = {"INCUMPLE": PatternFill("solid", fgColor="F8C9C9"),
+                           "PATENTE DUPLICADA": PatternFill("solid", fgColor="FDE9B8")}
+                for fila in ws.iter_rows(min_row=2):
+                    f = relleno.get(fila[cabeceras["Estado"] - 1].value)
+                    if f:
+                        for celda in fila:
+                            celda.fill = f
             for col in ws.columns:
                 ancho = max(len(str(c.value)) if c.value is not None else 0 for c in col[:200]) + 2
                 ws.column_dimensions[col[0].column_letter].width = min(max(ancho, 8), 70)
     return buf.getvalue()
 
 
-def estilo_estado(d: pd.DataFrame):
-    def color(v):
-        return {"OK": "background-color:#d9f2e0;color:#14532d",
-                "INCUMPLE": "background-color:#fde2e2;color:#7f1d1d"}.get(v, "")
-    sty = d.style
-    return sty.map(color, subset=["Estado"]) if hasattr(sty, "map") else sty.applymap(color, subset=["Estado"])
+FORMATO_NUM = {"Clientes": "{:.0f}", "Paletas (OB)": "{:.1f}", "Peso (Kg)": "{:.0f}"}
+COLOR_FILA = {
+    "INCUMPLE": "background-color:#f8c9c9;color:#7f1d1d",
+    "PATENTE DUPLICADA": "background-color:#fde9b8;color:#78350f",
+}
+
+
+def estilo_tabla(d: pd.DataFrame, colorear_filas: bool = False):
+    """Formatea números (Clientes y Kg enteros, OB 1 decimal) y, si se pide, pinta la fila entera según Estado."""
+    sty = d.style.format({k: v for k, v in FORMATO_NUM.items() if k in d.columns}, na_rep="")
+    if colorear_filas and "Estado" in d.columns:
+        sty = sty.apply(lambda r: [COLOR_FILA.get(r["Estado"], "")] * len(r), axis=1)
+    return sty
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -693,25 +721,31 @@ def main():
 
     total = len(res)
     n_inc = int((res["Estado"] == "INCUMPLE").sum())
+    n_dup = int((res["Duplicación de Patente"] != "").sum())
+    n_ok = int((res["Estado"] == "OK").sum())
     sin_asignar = len(df_sin_usar)
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Planillas procesadas", total)
-    k2.metric("Planillas OK", total - n_inc)
+    k2.metric("Planillas OK", n_ok)
     k3.metric("Con incumplimiento", n_inc)
-    k4.metric("Unidades disponibles sin asignar", sin_asignar)
+    k4.metric("Con patente duplicada", n_dup)
+    k5.metric("Unidades disponibles sin asignar", sin_asignar)
     st.caption(f"Flota: {origen} · {len(ctx.disponibles)} unidades DISPONIBLES · columna de estado: {col_estado}")
 
     tab_alertas, tab_audit = st.tabs(["🚨 Alertas e incumplimientos", "📋 Auditoría completa"])
 
-    cols_alerta = ["Planilla", "Vuelta", "Camión", "Patente", "Zona", "Clientes", "Paletas (OB)", "Peso (Kg)",
-                   "Incumplimiento Detectado", "Alternativas Sugeridas"]
+    base = ["Planilla", "Vuelta", "Camión", "Patente", "Zona", "Clientes", "Paletas (OB)", "Peso (Kg)"]
+    cols_alerta = base + ["Incumplimiento Detectado", "Alternativas Sugeridas"]
+    cols_dup = base + ["Duplicación de Patente", "Alternativas Sugeridas"]
     cfg = {
         "Incumplimiento Detectado": st.column_config.TextColumn(width="large"),
+        "Duplicación de Patente": st.column_config.TextColumn(width="large"),
         "Alternativas Sugeridas": st.column_config.TextColumn(width="large"),
     }
 
     with tab_alertas:
+        st.markdown("#### Incumplimientos de reglas operativas")
         alertas = res[res["Estado"] == "INCUMPLE"].copy()
         if alertas.empty:
             st.success("✅ Todas las planillas cumplen las reglas operativas.")
@@ -722,13 +756,23 @@ def main():
             alertas = alertas[alertas["Severidad"].isin(sevs) & alertas["Vuelta"].isin(vueltas)]
             alertas = alertas.sort_values("Severidad", key=lambda s: s.map(ORDEN_SEVERIDAD), kind="stable")
             st.caption(f"{len(alertas)} planilla(s) con desvíos. Ordenadas por severidad.")
-            st.dataframe(alertas[["Severidad"] + cols_alerta], hide_index=True, column_config=cfg)
+            st.dataframe(estilo_tabla(alertas[["Severidad"] + cols_alerta]), hide_index=True, column_config=cfg)
+
+        st.markdown("#### Duplicación de patente (misma patente en más de una planilla de la misma vuelta)")
+        dups_pl = res[res["Duplicación de Patente"] != ""].sort_values(["Patente", "Vuelta"])
+        if dups_pl.empty:
+            st.success("✅ No hay patentes duplicadas dentro de una misma vuelta.")
+        else:
+            st.caption(f"{len(dups_pl)} planilla(s) involucradas.")
+            st.dataframe(estilo_tabla(dups_pl[cols_dup]), hide_index=True, column_config=cfg)
 
     with tab_audit:
-        st.dataframe(estilo_estado(res), hide_index=True, column_config=cfg)
+        st.caption("🔴 Fila en rojo: incumple reglas · 🟡 Fila en amarillo: solo tiene patente duplicada")
+        st.dataframe(estilo_tabla(res, colorear_filas=True), hide_index=True, column_config=cfg)
         excel = a_excel({
             "Auditoría completa": res,
             "Alertas": res[res["Estado"] == "INCUMPLE"],
+            "Patente duplicada": res[res["Duplicación de Patente"] != ""],
             "Unidades libres": libres,
             "Patentes duplicadas": df_dups,
         })
