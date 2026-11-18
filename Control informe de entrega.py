@@ -15,6 +15,7 @@ from datetime import datetime
 
 import pandas as pd
 import requests
+from openpyxl.utils import get_column_letter
 import streamlit as st
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -62,7 +63,7 @@ RE_BALANCIN = re.compile(r"BALANC")
 
 ORDEN_SEVERIDAD = {"Crítico": 0, "Alto": 1, "Medio": 2, "": 3}
 
-CLAVES_PATENTE = {"PATENTE", "DOMINIO", "PAT"}
+CLAVES_PATENTE = ("PATENTE", "DOMINIO", "MATRICULA", "PAT")
 
 ALIAS_INFORME = {
     "planilla": ["PLANILLA"],
@@ -270,6 +271,28 @@ def _leer_hoja_con_encabezado(xl: pd.ExcelFile, hoja: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _leer_disponibilidad(xl: pd.ExcelFile, hoja: str) -> pd.DataFrame:
+    """Lee 'Disponibilidad flota Diaria' conservando la posición de las columnas.
+    Las columnas se rotulan con su letra de Excel (E · Matrícula, J · Estado, etc.)."""
+    raw = xl.parse(hoja, header=None, dtype=object)
+    if raw.empty:
+        raise ValueError(f"La pestaña '{hoja}' está vacía.")
+    idx = None
+    for i in range(min(25, len(raw))):
+        if any(clave(v) in CLAVES_PATENTE for v in raw.iloc[i].tolist()):
+            idx = i
+            break
+    etiquetas = []
+    for j in range(raw.shape[1]):
+        h = raw.iloc[idx, j] if idx is not None else None
+        txt = "" if h is None or pd.isna(h) else re.sub(r"\s+", " ", str(h)).strip()
+        letra = get_column_letter(j + 1)
+        etiquetas.append(f"{letra} · {txt}" if txt else letra)
+    df = raw.iloc[(idx + 1 if idx is not None else 0):].copy()
+    df.columns = etiquetas
+    return df.reset_index(drop=True)
+
+
 @st.cache_data(show_spinner="Procesando base de flota…")
 def parsear_flota(contenido: bytes):
     xl = pd.ExcelFile(io.BytesIO(contenido))
@@ -283,7 +306,7 @@ def parsear_flota(contenido: bytes):
             f"El archivo de flota no tiene la/s pestaña/s: {', '.join(faltan)}. "
             f"Pestañas encontradas: {', '.join(xl.sheet_names)}"
         )
-    return _leer_hoja_con_encabezado(xl, h_cam), _leer_hoja_con_encabezado(xl, h_disp)
+    return _leer_hoja_con_encabezado(xl, h_cam), _leer_disponibilidad(xl, h_disp)
 
 
 def detectar_cols_camiones(df: pd.DataFrame) -> dict:
@@ -320,32 +343,13 @@ def construir_flota(df: pd.DataFrame, col_pat: str, col_kg: str, col_pal: str, c
     return flota
 
 
-def columnas_estado(df: pd.DataFrame, col_pat: str) -> list:
-    return [c for c in df.columns
-            if c != col_pat and (df[c].map(norm_txt) == "DISPONIBLE").any()]
-
-
-def columna_para_fecha(columnas: list, fecha: tuple | None):
-    """Devuelve la columna cuyo encabezado coincide con la fecha del informe (dd, mm)."""
-    if not fecha:
-        return None
-    dd, mm = fecha
-    pat_a = re.compile(rf"(?<!\d)0?{dd}[/\-.]0?{mm}(?!\d)")
-    pat_b = re.compile(rf"-0?{mm}-0?{dd}(?!\d)")
-    for c in columnas:
-        if pat_a.search(str(c)) or pat_b.search(str(c)):
-            return c
-    return None
-
-
-def fecha_desde_nombre(nombre: str):
-    m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", nombre or "")
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
 def construir_disponibles(df: pd.DataFrame, col_pat: str, col_estado: str) -> set:
-    disp = {norm_pat(p) for p, e in zip(df[col_pat], df[col_estado]) if norm_txt(e) == "DISPONIBLE"}
-    disp.discard("")
+    disp = set()
+    for p, e in zip(df[col_pat], df[col_estado]):
+        pat = norm_pat(p)
+        # "NO DISPONIBLE" no empieza con DISPONIBLE, por lo que queda afuera
+        if re.fullmatch(r"[A-Z0-9]{6,7}", pat) and norm_txt(e).startswith("DISPONIBLE"):
+            disp.add(pat)
     return disp
 
 
@@ -612,10 +616,10 @@ def main():
     st.sidebar.success(f"Flota cargada desde {origen}")
 
     cols = detectar_cols_camiones(df_cam)
-    col_pat_disp = next((c for c in df_disp.columns if clave(c) in CLAVES_PATENTE), None)
-    cand_estado = columnas_estado(df_disp, col_pat_disp) if col_pat_disp else []
-    fecha = fecha_desde_nombre(informe_file.name) if informe_file else None
-    col_estado_def = columna_para_fecha(cand_estado, fecha) or (cand_estado[-1] if cand_estado else None)
+    etiquetas_disp = list(df_disp.columns)
+    def_pat_disp = next((c for c in etiquetas_disp if clave(c.split("·", 1)[-1]) in CLAVES_PATENTE), None) \
+        or (etiquetas_disp[4] if len(etiquetas_disp) > 4 else None)          # columna E
+    def_estado_disp = etiquetas_disp[9] if len(etiquetas_disp) > 9 else None  # columna J
 
     with st.sidebar:
         with st.expander("Mapeo de columnas de flota (avanzado)"):
@@ -631,10 +635,10 @@ def main():
             col_pat = sel("CAMIONES · Patente", cols["patente"], todas)
             col_kg = sel("CAMIONES · Peso máximo (kg)", cols["kg"], todas)
             col_pal = sel("CAMIONES · Paletas máx. (columna P)", cols["pal"], todas)
-            if cand_estado:
-                col_estado = sel("Disponibilidad · columna del día", col_estado_def, cand_estado)
-            else:
-                col_estado = None
+            col_pat_disp = sel("Disponibilidad · Matrícula/Patente (col. E)", def_pat_disp, etiquetas_disp)
+            col_estado = sel("Disponibilidad · Estado (col. J)", def_estado_disp, etiquetas_disp)
+            vals = df_disp[col_estado].map(norm_txt).replace("", pd.NA).dropna().value_counts().head(8)
+            st.caption("Valores en la columna de estado: " + ", ".join(f"{k} ({v})" for k, v in vals.items()))
 
         st.header("Reglas configurables")
         cols_tipo = detectar_cols_tipo(df_cam, {col_pat, col_kg, col_pal})
@@ -652,17 +656,18 @@ def main():
         pueblos_txt = st.text_area("Zonas consideradas pueblo/ruta", value=", ".join(PUEBLOS_DEFAULT))
         pueblos = parsear_lista(pueblos_txt)
 
-    if col_estado is None:
-        st.error(
-            "En 'Disponibilidad flota Diaria' no se encontró ninguna columna con el estado 'DISPONIBLE'. "
-            f"Columnas detectadas: {', '.join(map(str, df_disp.columns))}"
-        )
-        st.stop()
     if not flota:
         st.error("No se pudo construir la flota desde CAMIONES. Revisá el mapeo de columnas en la barra lateral.")
         st.stop()
 
     disponibles = construir_disponibles(df_disp, col_pat_disp, col_estado)
+    if not disponibles:
+        st.error(
+            f"No se encontró ninguna unidad DISPONIBLE usando '{col_pat_disp}' (patente) y '{col_estado}' (estado). "
+            "Revisá el mapeo de columnas en la barra lateral."
+        )
+        st.dataframe(df_disp.head(40))
+        st.stop()
     sin_datos = sorted(disponibles - set(flota))
     ctx = Ctx(flota, disponibles, linea, pueblos)
 
@@ -762,3 +767,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
