@@ -63,13 +63,15 @@ ZONAS_CABLES_BAJOS = {
     "B° Roma": r"\bB\.?\s?ROMA\b|\bBARRIO ROMA\b",
     "Centenario": r"\bCENTENARIO\b",
     "Yapeyú": r"\bYAPEYU\b",
-    "Santa Rosa": r"\bSANTA ROSA\b",
+    "Santa Rosa": r"\bSANTA ROSA\b(?! DE CALCHINES)",  # barrio; "Santa Rosa de Calchines" es zona de línea
     "Periferia": r"\bPERIFERIA\b",
 }
 
 # Zonas de línea / pueblos (Interior se trata aparte y es exclusiva de AG622AO)
+# Se pueden combinar entre sí (ej. CAYASTA/HELVECIA/STA ROSA/COSTA) y siguen siendo zona de línea.
 PUEBLOS_DEFAULT = [
     "Coronda", "Gálvez", "Laguna Paiva", "Costa", "Sauce Viejo", "San Carlos",
+    "Cayasta", "Helvecia", "Santa Rosa de Calchines", "Sta Rosa", "Calchines",
 ]
 
 RE_CENTRO = re.compile(r"\b(CENTRO|PUERTO)\b")
@@ -109,6 +111,11 @@ def norm_txt(s) -> str:
     t = "".join(c for c in t if not unicodedata.combining(c))
     t = t.upper().replace("°", "").replace("º", "")
     return re.sub(r"\s+", " ", t).strip()
+
+
+def norm_zona(s) -> str:
+    """Normaliza nombres de zona: sin distinguir mayúsculas/acentos y 'Sta.' -> 'Sta'."""
+    return re.sub(r"\bSTA\.\s*", "STA ", norm_txt(s))
 
 
 def clave(s) -> str:
@@ -218,7 +225,7 @@ def cargar_informe(archivo) -> tuple[pd.DataFrame, list[str]]:
     df["planilla"] = raw[col_pl].map(fmt_planilla)
     df["patente"] = raw[mapa["patente"]].map(norm_pat)
     df["zona_orig"] = raw[mapa["zona"]].fillna("").astype(str).str.strip()
-    df["zona"] = raw[mapa["zona"]].map(norm_txt)
+    df["zona"] = raw[mapa["zona"]].map(norm_zona)
     df["cli"] = a_numero(raw[mapa["cli"]])
     df["ob"] = a_numero(raw[mapa["ob"]])
     df["kg"] = a_numero(raw[mapa["kg"]])
@@ -399,7 +406,7 @@ class Ctx:
         self.linea = linea
         self.estados: dict = {}  # patente -> estado en el parte diario (lo completa main)
         self.ocup: dict = {1: {}, 2: {}}  # patente -> índices de planillas, por vuelta (lo completa auditar)
-        pueblos_n = [norm_txt(p) for p in pueblos if norm_txt(p)]
+        pueblos_n = [norm_zona(p) for p in pueblos if norm_zona(p)]
         self.re_pueblo = (
             re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pueblos_n) + r")\b") if pueblos_n else None
         )
@@ -490,6 +497,8 @@ def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tu
 
     if pat in CABLES_BAJOS_PROHIBIDAS:
         hits = [nom for nom, rx in ZONAS_CABLES_BAJOS.items() if re.search(rx, zona)]
+        if es_pueblo:  # combinada con otras zonas de línea (ej. SANTA ROSA/COSTA): es Calchines, no el barrio
+            hits = [h for h in hits if h != "Santa Rosa"]
         if hits:
             out.append(("Alto", f"Cables bajos: la zona '{zona_o}' ({', '.join(hits)}) tiene prohibida la unidad {pat}."))
 
