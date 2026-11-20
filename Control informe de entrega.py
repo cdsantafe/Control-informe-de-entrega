@@ -27,7 +27,19 @@ URL_FLOTA = (
 )
 
 UNIDAD_RESTRINGIDA = "AG622AO"
-ZONAS_AG622AO = ["SAN JUSTO", "SAN JAVIER", "EMILIA", "VIDELA"]
+# Zonas "Interior": las cubre la unidad destinada AG622AO
+ZONAS_INTERIOR = ["SAN JUSTO", "SAN JAVIER", "EMILIA", "VIDELA"]
+
+# Flota de línea (11 unidades): tienen prioridad en zonas de línea / pueblos.
+# Solo si ninguna está disponible y libre se puede usar una unidad de Santa Fe / Santo Tomé.
+LINEA_FIJA = [
+    "AD413RY", "AA932SE", "LWT087", "NJK122", "KKF571", "NNF606",
+    "NMH398", "PME394", "NHH822", "AB071NV", "AA639XH",
+]
+
+# Paraná: zona exclusiva de estas unidades (SMK / mayoristas). No están limitadas a Paraná.
+PARANA_UNIDADES = {"AB071NV", "AA639XH", "AD413RY", "AF520BS", "AH243PW", "AH243YU"}
+RE_PARANA = re.compile(r"\bPARANA\b")
 
 UNIDADES_CENTRO = {"AH474WT", "PAP418"}
 CENTRO_MAX_OB = 10
@@ -42,6 +54,7 @@ GAS_EXCEPCION_CLI = 5  # no aplica límite si Cli. < 5
 
 CABLES_BAJOS_PROHIBIDAS = {
     "NIF946", "PJX924", "NHH822", "OTW502", "PPN082", "MPS763", "AE514OY", "AE514OZ",
+    "AF520BS",  # unidad "alta"
 }
 ZONAS_CABLES_BAJOS = {
     "Barranquitas": r"\bBARRANQUITAS\b",
@@ -51,11 +64,12 @@ ZONAS_CABLES_BAJOS = {
     "Centenario": r"\bCENTENARIO\b",
     "Yapeyú": r"\bYAPEYU\b",
     "Santa Rosa": r"\bSANTA ROSA\b",
+    "Periferia": r"\bPERIFERIA\b",
 }
 
+# Zonas de línea / pueblos (Interior se trata aparte y es exclusiva de AG622AO)
 PUEBLOS_DEFAULT = [
     "Coronda", "Gálvez", "Laguna Paiva", "Costa", "Sauce Viejo", "San Carlos",
-    "San Justo", "San Javier", "Emilia", "Videla",
 ]
 
 RE_CENTRO = re.compile(r"\b(CENTRO|PUERTO)\b")
@@ -344,14 +358,35 @@ def construir_flota(df: pd.DataFrame, col_pat: str, col_kg: str, col_pal: str, c
     return flota
 
 
+ESTADOS_UTILIZABLES = ("DISPONIBLE", "RESERVA")  # "Reserva" se usa igual que "Disponible"
+
+
+def es_utilizable(estado) -> bool:
+    # "NO DISPONIBLE" no empieza con DISPONIBLE, por lo que queda afuera
+    return norm_txt(estado).startswith(ESTADOS_UTILIZABLES)
+
+
 def construir_disponibles(df: pd.DataFrame, col_pat: str, col_estado: str) -> set:
     disp = set()
     for p, e in zip(df[col_pat], df[col_estado]):
         pat = norm_pat(p)
-        # "NO DISPONIBLE" no empieza con DISPONIBLE, por lo que queda afuera
-        if re.fullmatch(r"[A-Z0-9]{6,7}", pat) and norm_txt(e).startswith("DISPONIBLE"):
+        if re.fullmatch(r"[A-Z0-9]{6,7}", pat) and es_utilizable(e):
             disp.add(pat)
     return disp
+
+
+def construir_estados(df: pd.DataFrame, col_pat: str, col_estado: str) -> dict:
+    """patente -> estado tal cual figura en el parte diario (si repite, prevalece el utilizable)."""
+    estados: dict = {}
+    for p, e in zip(df[col_pat], df[col_estado]):
+        pat = norm_pat(p)
+        if not re.fullmatch(r"[A-Z0-9]{6,7}", pat):
+            continue
+        txt = "" if e is None or (not isinstance(e, str) and pd.isna(e)) else str(e).strip()
+        txt = txt or "(sin estado)"
+        if pat not in estados or es_utilizable(txt):
+            estados[pat] = txt
+    return estados
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -362,10 +397,24 @@ class Ctx:
         self.flota = flota
         self.disponibles = disponibles
         self.linea = linea
+        self.estados: dict = {}  # patente -> estado en el parte diario (lo completa main)
+        self.ocup: dict = {1: {}, 2: {}}  # patente -> índices de planillas, por vuelta (lo completa auditar)
         pueblos_n = [norm_txt(p) for p in pueblos if norm_txt(p)]
         self.re_pueblo = (
             re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pueblos_n) + r")\b") if pueblos_n else None
         )
+
+
+def lineas_libres(p: dict, ctx: Ctx) -> list[str]:
+    """Unidades de línea DISPONIBLES, libres en la vuelta de la planilla y que la cumplen sin romper otras reglas."""
+    ocupadas = ctx.ocup.get(p["vuelta"], {})
+    res = []
+    for c in sorted(ctx.linea):
+        if c not in ctx.disponibles or c in ocupadas or c not in ctx.flota:
+            continue
+        if not evaluar(p, c, ctx, verificar_disp=False):
+            res.append(c)
+    return res
 
 
 def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tuple[str, str]]:
@@ -381,7 +430,9 @@ def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tu
 
     # 1) Disponibilidad ------------------------------------------------------
     if verificar_disp and pat not in ctx.disponibles:
-        out.append(("Alto", f"Disponibilidad: la patente {pat} no figura como DISPONIBLE en el parte diario de flota."))
+        est = ctx.estados.get(pat)
+        detalle = f"figura como '{est}'" if est else "no figura"
+        out.append(("Alto", f"Disponibilidad: la patente {pat} {detalle} en el parte diario (no está DISPONIBLE ni en RESERVA)."))
 
     # 2) Capacidad física ----------------------------------------------------
     if u is None:
@@ -394,16 +445,26 @@ def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tu
         out.append(("Alto", f"Exceso de paletas: OB {n(ob)} supera la capacidad de la unidad ({n(max_pal)} paletas)."))
 
     # 3) Restricciones geográficas y de ruta ---------------------------------
-    es_pueblo = bool(ctx.re_pueblo and ctx.re_pueblo.search(zona))
+    es_interior = any(z in zona for z in ZONAS_INTERIOR)
+    es_parana = bool(RE_PARANA.search(zona))
+    es_pueblo = bool(ctx.re_pueblo and ctx.re_pueblo.search(zona)) and not es_interior
     tipo = (u["tipo"] if u is not None else "")
     if es_actual:
         tipo = f"{tipo} | {norm_txt(p['camion'])}"
 
     if pat == UNIDAD_RESTRINGIDA:
-        if not any(z in zona for z in ZONAS_AG622AO):
-            out.append(("Crítico", f"Incumplimiento crítico: AG622AO solo puede usarse en San Justo, San Javier o Emilia/Videla y está asignada a '{zona_o}'."))
-    elif es_pueblo and ctx.linea and pat not in ctx.linea:
-        out.append(("Alto", f"Pueblo/ruta: la zona '{zona_o}' solo puede cubrirla una de las unidades habilitadas de línea y {pat} no lo es."))
+        if not es_interior:
+            out.append(("Crítico", f"Incumplimiento crítico: AG622AO está destinada exclusivamente a zonas Interior (San Justo, San Javier, Emilia/Videla) y está asignada a '{zona_o}'."))
+    else:
+        if es_interior:
+            out.append(("Alto", f"Interior: la zona '{zona_o}' es exclusiva de AG622AO y {pat} no puede cubrirla."))
+        if es_parana and pat not in PARANA_UNIDADES:
+            out.append(("Alto", f"Paraná: zona exclusiva de {', '.join(sorted(PARANA_UNIDADES))}; {pat} no está habilitada."))
+        if es_pueblo and ctx.linea and pat not in ctx.linea:
+            libres = lineas_libres(p, ctx)
+            if libres:
+                out.append(("Alto", f"Zona de línea ('{zona_o}'): hay unidad de línea disponible y libre en la {p['vuelta']}ª vuelta ({', '.join(libres[:4])}); "
+                                    f"{pat} (Santa Fe/Santo Tomé) solo puede usarse si no hay ninguna de línea disponible."))
 
     if not es_pueblo and RE_CENTRO.search(zona) and pat not in UNIDADES_CENTRO:
         motivos = []
@@ -436,42 +497,6 @@ def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tu
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# MOTOR DE ALTERNATIVAS
-# ════════════════════════════════════════════════════════════════════════════
-def sugerir(i: int, planillas: list[dict], ocup: dict, ctx: Ctx, max_alt: int = 3) -> str:
-    p = planillas[i]
-    v, otra = p["vuelta"], (2 if p["vuelta"] == 1 else 1)
-    cands = []
-    for cand in ctx.disponibles:
-        u = ctx.flota.get(cand)
-        if cand == p["patente"] or u is None or pd.isna(u["kg"]) or pd.isna(u["pal"]):
-            continue
-        if evaluar(p, cand, ctx, verificar_disp=False):
-            continue
-        ocup_v = ocup[v].get(cand, [])
-        ocup_o = ocup[otra].get(cand, [])
-        info = f"{n(u['pal'])} pal / {n(u['kg'])} kg"
-        if not ocup_v and not ocup_o:
-            cands.append((1, u["pal"], u["kg"], f"{cand} · 100% libre (1ª y 2ª vuelta) · {info}"))
-        elif not ocup_v:
-            pl = ", ".join(planillas[j]["planilla"] for j in ocup_o)
-            cands.append((2, u["pal"], u["kg"], f"{cand} · libre en {v}ª vuelta (ocupada en {otra}ª, planilla {pl}) · {info}"))
-        else:
-            # Enroque: la candidata está en otra planilla de la misma vuelta; solo se propone si
-            # la unidad actual cumple todas las reglas en esa otra planilla.
-            if len(ocup_v) == 1 and p["patente"]:
-                q = planillas[ocup_v[0]]
-                if not evaluar(q, p["patente"], ctx, verificar_disp=False) and p["patente"] in ctx.disponibles:
-                    cands.append((3, u["pal"], u["kg"],
-                                  f"{cand} · requiere enroque con planilla {q['planilla']} ({q['zona_orig'] or 's/d'}), "
-                                  f"donde {p['patente']} sí cumple · {info}"))
-    if not cands:
-        return "Sin alternativas válidas en la flota disponible."
-    cands.sort(key=lambda x: (x[0], x[1], x[2]))  # prioridad, y la unidad más ajustada primero
-    return " | ".join(f"{k}) {c[3]}" for k, c in enumerate(cands[:max_alt], 1))
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # AUDITORÍA COMPLETA
 # ════════════════════════════════════════════════════════════════════════════
 def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
@@ -481,6 +506,7 @@ def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
         if p["patente"]:
             ocup[p["vuelta"]].setdefault(p["patente"], []).append(i)
 
+    ctx.ocup = ocup
     filas = []
     for i, p in enumerate(planillas):
         try:
@@ -490,9 +516,8 @@ def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
             if p["patente"] and len(dup) > 1:
                 otras = ", ".join(planillas[j]["planilla"] for j in dup if j != i)
                 dup_txt = f"{p['patente']} también está en la/s planilla/s {otras} de la {p['vuelta']}ª vuelta."
-            alt = sugerir(i, planillas, ocup, ctx) if (probs or dup_txt) else ""
         except Exception as e:  # una fila problemática no debe tumbar toda la auditoría
-            probs, dup_txt, alt = [("Medio", f"No se pudo auditar la planilla: {e}")], "", ""
+            probs, dup_txt = [("Medio", f"No se pudo auditar la planilla: {e}")], ""
 
         sev = min((s for s, _ in probs), key=lambda s: ORDEN_SEVERIDAD[s]) if probs else ""
         u = ctx.flota.get(p["patente"])
@@ -510,7 +535,6 @@ def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
             "Severidad": sev,
             "Incumplimiento Detectado": " ‖ ".join(f"{k}) {t}" for k, (_, t) in enumerate(probs, 1)),
             "Duplicación de Patente": dup_txt,
-            "Alternativas Sugeridas": alt,
         })
     out = pd.DataFrame(filas)
     # Formatos: clientes y kg en unidades enteras, OB con 1 decimal
@@ -537,6 +561,17 @@ def unidades_libres(ctx: Ctx, df: pd.DataFrame) -> pd.DataFrame:
             "Tipo": u.get("tipo", ""),
         })
     return pd.DataFrame(filas, columns=["Patente", "Disponibilidad", "Paletas máx.", "Peso máx. (Kg)", "Línea", "Tipo"])
+
+
+def facturadas_no_disponibles(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
+    """Unidades que figuran en el informe (facturadas) pero no están DISPONIBLE ni en RESERVA en el parte diario."""
+    cols = ["Planilla", "Vuelta", "Patente", "Zona", "Estado en parte diario"]
+    d = df[(df["patente"] != "") & (~df["patente"].isin(ctx.disponibles))]
+    filas = [{
+        "Planilla": r.planilla, "Vuelta": r.vuelta, "Patente": r.patente, "Zona": r.zona_orig,
+        "Estado en parte diario": ctx.estados.get(r.patente, "No figura en el parte diario"),
+    } for r in d.itertuples()]
+    return pd.DataFrame(filas, columns=cols)
 
 
 def patentes_duplicadas(df: pd.DataFrame) -> pd.DataFrame:
@@ -671,17 +706,16 @@ def main():
         st.header("Reglas configurables")
         cols_tipo = detectar_cols_tipo(df_cam, {col_pat, col_kg, col_pal})
         flota = construir_flota(df_cam, col_pat, col_kg, col_pal, cols_tipo)
-        linea_auto = sorted(p for p, u in flota.items() if u["linea"])
         linea_txt = st.text_area(
-            "Patentes de flota de línea (las 11 habilitadas)", value=", ".join(linea_auto),
-            help="Se autocompleta si CAMIONES indica 'Línea' en alguna columna de tipo. Editá la lista si hace falta.",
+            "Patentes de flota de línea (11 habilitadas, con prioridad)", value=", ".join(LINEA_FIJA),
+            help="Tienen prioridad en zonas de línea. Solo si ninguna está disponible se puede usar una unidad de Santa Fe / Santo Tomé.",
         )
         linea = {norm_pat(x) for x in parsear_lista(linea_txt)}
         if not linea:
             st.warning("Sin patentes de línea cargadas: la regla de pueblos/rutas queda desactivada.")
         elif len(linea) != 11:
             st.warning(f"Hay {len(linea)} patentes de línea cargadas (se esperaban 11).")
-        pueblos_txt = st.text_area("Zonas consideradas pueblo/ruta", value=", ".join(PUEBLOS_DEFAULT))
+        pueblos_txt = st.text_area("Zonas de línea / pueblo (Interior se controla aparte)", value=", ".join(PUEBLOS_DEFAULT))
         pueblos = parsear_lista(pueblos_txt)
 
     if not flota:
@@ -698,6 +732,7 @@ def main():
         st.stop()
     sin_datos = sorted(disponibles - set(flota))
     ctx = Ctx(flota, disponibles, linea, pueblos)
+    ctx.estados = construir_estados(df_disp, col_pat_disp, col_estado)
 
     if informe_file is None:
         st.info("Cargá el Informe de Entrega para iniciar la auditoría.")
@@ -717,6 +752,7 @@ def main():
         res = auditar(df, ctx)
         libres = unidades_libres(ctx, df)
         df_dups = patentes_duplicadas(df)
+        df_nd = facturadas_no_disponibles(df, ctx)
         df_sin_usar = libres[libres["Disponibilidad"] == "Libre 1ª y 2ª vuelta"].reset_index(drop=True)
 
     total = len(res)
@@ -736,12 +772,11 @@ def main():
     tab_alertas, tab_audit = st.tabs(["🚨 Alertas e incumplimientos", "📋 Auditoría completa"])
 
     base = ["Planilla", "Vuelta", "Camión", "Patente", "Zona", "Clientes", "Paletas (OB)", "Peso (Kg)"]
-    cols_alerta = base + ["Incumplimiento Detectado", "Alternativas Sugeridas"]
-    cols_dup = base + ["Duplicación de Patente", "Alternativas Sugeridas"]
+    cols_alerta = base + ["Incumplimiento Detectado"]
+    cols_dup = base + ["Duplicación de Patente"]
     cfg = {
         "Incumplimiento Detectado": st.column_config.TextColumn(width="large"),
         "Duplicación de Patente": st.column_config.TextColumn(width="large"),
-        "Alternativas Sugeridas": st.column_config.TextColumn(width="large"),
     }
 
     with tab_alertas:
@@ -775,6 +810,7 @@ def main():
             "Patente duplicada": res[res["Duplicación de Patente"] != ""],
             "Unidades libres": libres,
             "Patentes duplicadas": df_dups,
+            "Facturadas no disponibles": df_nd,
         })
         st.download_button(
             "⬇️ Descargar auditoría en Excel", data=excel,
@@ -803,6 +839,13 @@ def main():
             st.success(f"{len(df_sin_usar)} unidad(es) disponibles sin asignar en todo el día.")
             st.dataframe(df_sin_usar, hide_index=True)
 
+    st.markdown("### 🚫 Unidades facturadas que figuran como indisponibles")
+    if df_nd.empty:
+        st.success("Todas las unidades facturadas figuran como DISPONIBLE o en RESERVA en el parte diario.")
+    else:
+        st.error(f"{len(df_nd)} planilla(s) con unidades que no están disponibles ni en reserva según el parte diario.")
+        st.dataframe(df_nd, hide_index=True)
+
     df_parciales = libres[libres["Disponibilidad"] != "Libre 1ª y 2ª vuelta"]
     if not df_parciales.empty:
         with st.expander(f"🟡 Unidades libres solo en una vuelta ({len(df_parciales)})"):
@@ -811,4 +854,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
