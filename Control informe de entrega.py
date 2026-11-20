@@ -406,22 +406,37 @@ class Ctx:
         self.linea = linea
         self.estados: dict = {}  # patente -> estado en el parte diario (lo completa main)
         self.ocup: dict = {1: {}, 2: {}}  # patente -> índices de planillas, por vuelta (lo completa auditar)
+        self.planillas: list = []          # planillas del informe (lo completa auditar)
         pueblos_n = [norm_zona(p) for p in pueblos if norm_zona(p)]
         self.re_pueblo = (
             re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pueblos_n) + r")\b") if pueblos_n else None
         )
 
 
-def lineas_libres(p: dict, ctx: Ctx) -> list[str]:
-    """Unidades de línea DISPONIBLES, libres en la vuelta de la planilla y que la cumplen sin romper otras reglas."""
-    ocupadas = ctx.ocup.get(p["vuelta"], {})
-    res = []
+def es_zona_linea(zona: str, ctx: Ctx) -> bool:
+    if any(z in zona for z in ZONAS_INTERIOR):
+        return False
+    return bool(ctx.re_pueblo and ctx.re_pueblo.search(zona))
+
+
+def lineas_utilizables(p: dict, ctx: Ctx) -> tuple[list[str], list[tuple[str, str, str]]]:
+    """Unidades de línea DISPONIBLES (o en RESERVA) que podrían cubrir la planilla `p`.
+    - libres: no están asignadas en la vuelta de la planilla.
+    - reasignables: están asignadas en esa vuelta, pero solo a planillas que NO son de zona de línea (enroque posible).
+    Una unidad de línea asignada a otra zona de línea se considera bien usada y no cuenta."""
+    ocup = ctx.ocup.get(p["vuelta"], {})
+    libres, reasignables = [], []
     for c in sorted(ctx.linea):
-        if c not in ctx.disponibles or c in ocupadas or c not in ctx.flota:
+        if c not in ctx.disponibles or c not in ctx.flota:
             continue
-        if not evaluar(p, c, ctx, verificar_disp=False):
-            res.append(c)
-    return res
+        if evaluar(p, c, ctx, verificar_disp=False):
+            continue
+        ocupantes = [ctx.planillas[j] for j in ocup.get(c, [])]
+        if not ocupantes:
+            libres.append(c)
+        elif all(not es_zona_linea(q["zona"], ctx) for q in ocupantes):
+            reasignables.append((c, ", ".join(q["planilla"] for q in ocupantes), ocupantes[0]["zona_orig"] or "s/d"))
+    return libres, reasignables
 
 
 def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tuple[str, str]]:
@@ -468,10 +483,17 @@ def evaluar(p: dict, pat: str, ctx: Ctx, verificar_disp: bool = True) -> list[tu
         if es_parana and pat not in PARANA_UNIDADES:
             out.append(("Alto", f"Paraná: zona exclusiva de {', '.join(sorted(PARANA_UNIDADES))}; {pat} no está habilitada."))
         if es_pueblo and ctx.linea and pat not in ctx.linea:
-            libres = lineas_libres(p, ctx)
-            if libres:
-                out.append(("Alto", f"Zona de línea ('{zona_o}'): hay unidad de línea disponible y libre en la {p['vuelta']}ª vuelta ({', '.join(libres[:4])}); "
-                                    f"{pat} (Santa Fe/Santo Tomé) solo puede usarse si no hay ninguna de línea disponible."))
+            libres, reasig = lineas_utilizables(p, ctx)
+            if libres or reasig:
+                partes = []
+                if libres:
+                    partes.append(f"libres en la {p['vuelta']}ª vuelta: {', '.join(libres[:4])}")
+                if reasig:
+                    partes.append("asignadas a zonas que no son de línea: " +
+                                  "; ".join(f"{c} (planilla {pl}, {z})" for c, pl, z in reasig[:3]))
+                out.append(("Alto", f"Zona de línea ('{zona_o}') cubierta por {pat}, que no es unidad de línea. "
+                                    f"Hay unidades de línea disponibles → {' | '.join(partes)}. "
+                                    "Una unidad de Santa Fe/Santo Tomé solo se admite si no queda ninguna de línea disponible."))
 
     if not es_pueblo and RE_CENTRO.search(zona) and pat not in UNIDADES_CENTRO:
         motivos = []
@@ -516,6 +538,7 @@ def auditar(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
             ocup[p["vuelta"]].setdefault(p["patente"], []).append(i)
 
     ctx.ocup = ocup
+    ctx.planillas = planillas
     filas = []
     for i, p in enumerate(planillas):
         try:
