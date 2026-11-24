@@ -90,7 +90,7 @@ ALIAS_INFORME = {
     "ob": ["OB"],
     "kg": ["KGRTRUCK", "KGTRUCK"],
     "cap": ["CAPACIDADTRUCKCAMION", "CAPACIDADTRUCK"],
-    "vuelta": ["VUELTA", "SALIDA", "VTA"],
+    "vuelta": ["VUELTA", "TIPODEREPARTO", "SALIDA", "VTA"],
     "camion": ["CAMION", "TIPOCAMION", "TRUCK", "VEHICULO", "TIPOTRUCK"],
 }
 REQUERIDAS_INFORME = ["planilla", "patente", "zona", "cli", "ob", "kg"]
@@ -170,7 +170,7 @@ def parse_vuelta(v) -> int:
     t = norm_txt(v)
     if not t:
         return 1
-    if "2" in t or t.startswith("SEG"):
+    if "2" in t or "SEG" in t:  # "2", "2da", "2° reparto", "Segunda", "Segundo reparto"…
         return 2
     return 1
 
@@ -241,8 +241,8 @@ def cargar_informe(archivo) -> tuple[pd.DataFrame, list[str]]:
     else:
         df["vuelta"] = 1
         avisos.append(
-            "No se encontró una columna de 'Vuelta' en Salidas: se asume Primera Vuelta para todas las "
-            "planillas, por lo que la disponibilidad por vuelta de las alternativas es aproximada."
+            "No se encontró la columna de vuelta ('Vuelta' o 'TIPO DE REPARTO') en Salidas: se asume Primera Vuelta "
+            "para todas las planillas, por lo que el control de patentes duplicadas y de unidades libres por vuelta es aproximado."
         )
 
     if "camion" in mapa:
@@ -250,7 +250,13 @@ def cargar_informe(archivo) -> tuple[pd.DataFrame, list[str]]:
     else:
         df["camion"] = ""
 
-    return df.reset_index(drop=True), avisos
+    df = df.reset_index(drop=True)
+    if "vuelta" in mapa:
+        # valores originales -> vuelta asignada, para que se pueda verificar la lectura
+        vistos = raw[mapa["vuelta"]].fillna("").astype(str).str.strip().drop_duplicates()
+        df.attrs["mapa_vuelta"] = {v or "(vacío)": parse_vuelta(v) for v in vistos}
+        df.attrs["col_vuelta"] = mapa["vuelta"]
+    return df, avisos
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -606,6 +612,30 @@ def facturadas_no_disponibles(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
     return pd.DataFrame(filas, columns=cols)
 
 
+def camiones_indisponibles(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
+    """Todos los camiones de la flota (CAMIONES / parte diario) que no están DISPONIBLE ni en RESERVA."""
+    cols = ["Patente", "Estado en parte diario", "Facturada en informe", "Paletas máx.", "Peso máx. (Kg)", "Línea", "Tipo"]
+    usos: dict = {}
+    for r in df.itertuples():
+        if r.patente:
+            usos.setdefault(r.patente, []).append(f"{r.planilla} ({r.vuelta}ª)")
+    filas = []
+    for pat in sorted(set(ctx.estados) | set(ctx.flota)):
+        if pat in ctx.disponibles:
+            continue
+        u = ctx.flota.get(pat, {})
+        filas.append({
+            "Patente": pat,
+            "Estado en parte diario": ctx.estados.get(pat, "No figura en el parte diario"),
+            "Facturada en informe": ", ".join(usos[pat]) if pat in usos else "No",
+            "Paletas máx.": u.get("pal", float("nan")),
+            "Peso máx. (Kg)": u.get("kg", float("nan")),
+            "Línea": "Sí" if pat in ctx.linea else "No",
+            "Tipo": u.get("tipo", ""),
+        })
+    return pd.DataFrame(filas, columns=cols)
+
+
 def patentes_duplicadas(df: pd.DataFrame) -> pd.DataFrame:
     """Patentes asignadas a más de una planilla dentro de la misma vuelta."""
     cols = ["Patente", "Vuelta", "Cant. planillas", "Planillas", "Zonas"]
@@ -775,6 +805,11 @@ def main():
     except Exception as e:
         st.error(f"No se pudo procesar el informe: {e}")
         st.stop()
+    if df.attrs.get("mapa_vuelta"):
+        st.caption(
+            f"Vuelta leída de la columna '{df.attrs['col_vuelta']}': "
+            + " · ".join(f"{k} → {v}ª" for k, v in list(df.attrs["mapa_vuelta"].items())[:12])
+        )
     for a in avisos:
         st.warning(a)
     if sin_datos:
@@ -785,6 +820,7 @@ def main():
         libres = unidades_libres(ctx, df)
         df_dups = patentes_duplicadas(df)
         df_nd = facturadas_no_disponibles(df, ctx)
+        df_indisp = camiones_indisponibles(df, ctx)
         df_sin_usar = libres[libres["Disponibilidad"] == "Libre 1ª y 2ª vuelta"].reset_index(drop=True)
 
     total = len(res)
@@ -843,6 +879,7 @@ def main():
             "Unidades libres": libres,
             "Patentes duplicadas": df_dups,
             "Facturadas no disponibles": df_nd,
+            "Camiones indisponibles": df_indisp,
         })
         st.download_button(
             "⬇️ Descargar auditoría en Excel", data=excel,
@@ -877,6 +914,14 @@ def main():
     else:
         st.error(f"{len(df_nd)} planilla(s) con unidades que no están disponibles ni en reserva según el parte diario.")
         st.dataframe(df_nd, hide_index=True)
+
+    st.markdown("### ⛔ Camiones indisponibles (parte diario)")
+    if df_indisp.empty:
+        st.success("No hay camiones indisponibles: toda la flota figura DISPONIBLE o en RESERVA.")
+    else:
+        st.caption(f"{len(df_indisp)} camión(es) que no están DISPONIBLE ni en RESERVA. "
+                   "La columna 'Facturada en informe' muestra si igual aparecen asignados en alguna planilla.")
+        st.dataframe(df_indisp, hide_index=True)
 
     df_parciales = libres[libres["Disponibilidad"] != "Libre 1ª y 2ª vuelta"]
     if not df_parciales.empty:
