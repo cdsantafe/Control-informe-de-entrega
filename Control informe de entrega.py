@@ -613,20 +613,22 @@ def facturadas_no_disponibles(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
 
 
 def camiones_indisponibles(df: pd.DataFrame, ctx: Ctx) -> pd.DataFrame:
-    """Todos los camiones de la flota (CAMIONES / parte diario) que no están DISPONIBLE ni en RESERVA."""
+    """Camiones que figuran en 'Disponibilidad flota Diaria' con un estado que no es DISPONIBLE ni RESERVA.
+    Solo se listan las patentes presentes en el parte diario y con estado cargado; las que están solo en
+    CAMIONES (sin fila en el parte) o con el estado vacío no se consideran."""
     cols = ["Patente", "Estado en parte diario", "Facturada en informe", "Paletas máx.", "Peso máx. (Kg)", "Línea", "Tipo"]
     usos: dict = {}
     for r in df.itertuples():
         if r.patente:
             usos.setdefault(r.patente, []).append(f"{r.planilla} ({r.vuelta}ª)")
     filas = []
-    for pat in sorted(set(ctx.estados) | set(ctx.flota)):
-        if pat in ctx.disponibles:
+    for pat in sorted(ctx.estados):
+        if pat in ctx.disponibles or ctx.estados[pat] == "(sin estado)":
             continue
         u = ctx.flota.get(pat, {})
         filas.append({
             "Patente": pat,
-            "Estado en parte diario": ctx.estados.get(pat, "No figura en el parte diario"),
+            "Estado en parte diario": ctx.estados[pat],
             "Facturada en informe": ", ".join(usos[pat]) if pat in usos else "No",
             "Paletas máx.": u.get("pal", float("nan")),
             "Peso máx. (Kg)": u.get("kg", float("nan")),
@@ -919,7 +921,7 @@ def main():
     if df_indisp.empty:
         st.success("No hay camiones indisponibles: toda la flota figura DISPONIBLE o en RESERVA.")
     else:
-        st.caption(f"{len(df_indisp)} camión(es) que no están DISPONIBLE ni en RESERVA. "
+        st.caption(f"{len(df_indisp)} camión(es) del parte 'Disponibilidad flota Diaria' que no están DISPONIBLE ni en RESERVA. "
                    "La columna 'Facturada en informe' muestra si igual aparecen asignados en alguna planilla.")
         st.dataframe(df_indisp, hide_index=True)
 
